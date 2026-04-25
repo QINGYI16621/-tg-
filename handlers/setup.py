@@ -56,6 +56,7 @@ async def send_main_menu(client, message):
     ]
     if is_adm:
         buttons.append([KeyboardButton("👮 管理员")])
+    buttons.append([KeyboardButton("❌ 取消操作")])
         
     await message.reply_text(
         "👋 **欢迎回到私人文件保险箱！**\n\n"
@@ -74,6 +75,7 @@ def get_main_menu_keyboard(is_admin_user=False):
     ]
     if is_admin_user:
         buttons.append([KeyboardButton("👮 管理员")])
+    buttons.append([KeyboardButton("❌ 取消操作")])
     
     return ReplyKeyboardMarkup(
         buttons, 

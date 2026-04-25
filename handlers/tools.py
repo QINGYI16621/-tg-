@@ -205,6 +205,23 @@ from datetime import datetime, timedelta
 # User Request History for Rate Limiting
 user_request_history = {}
 
+def get_cancel_keyboard(is_admin_user=False):
+    buttons = [[KeyboardButton("❌ 取消操作"), KeyboardButton("🔙 返回主菜单")]]
+    if is_admin_user:
+        buttons.insert(0, [KeyboardButton("📥 批量下载"), KeyboardButton("☁️ 存储/上传")])
+    return ReplyKeyboardMarkup(
+        buttons,
+        resize_keyboard=True,
+        one_time_keyboard=False,
+        is_persistent=True,
+        placeholder="可取消或返回主菜单"
+    )
+
+async def clear_user_state(user_id):
+    user_interaction_state.pop(user_id, None)
+    user_pending_file.pop(user_id, None)
+    user_download_dest.pop(user_id, None)
+
 async def check_auth(client, message):
     """
     统一权限验证 (Auth + Rate Limit)
@@ -804,8 +821,13 @@ async def download_dest_callback(client: Client, callback: CallbackQuery):
         f"扫描最近媒体：`频道ID 数量`\n"
         f"精准下载某条消息：`频道ID 消息ID 数量`\n\n"
         f"例如：`-1001234567890 10`\n"
-        f"例如：`-1001234567890 4567 1`",
-        reply_markup=ForceReply(placeholder="消息链接 / 频道ID 数量 / 频道ID 消息ID 数量")
+        f"例如：`-1001234567890 4567 1`\n\n"
+        f"发 `取消` 或点 **❌ 取消操作** 可退出。"
+    )
+    await client.send_message(
+        callback.message.chat.id,
+        "请发送消息链接或下载参数：",
+        reply_markup=get_cancel_keyboard(callback.from_user.id == client.admin_id)
     )
     await callback.answer(f"已选择: {dest_name}")
 
@@ -2471,7 +2493,7 @@ async def menu_download_handler(client, message):
         [KeyboardButton("📋 最近对话"), KeyboardButton("🔍 搜索对话")],
         [KeyboardButton("🎞 媒体定位"), KeyboardButton("📥 开始下载")],
         [KeyboardButton("👻 删除账户")],
-        [KeyboardButton("🔙 返回主菜单")]
+        [KeyboardButton("❌ 取消操作"), KeyboardButton("🔙 返回主菜单")]
     ]
     await message.reply_text(
         "📥 **批量下载工具箱 (管理员)**\n\n"
@@ -2509,13 +2531,15 @@ async def sub_deleted_handler(client, message):
 async def sub_media_locator_handler(client, message):
     from pyrogram.types import ForceReply
     user_interaction_state[message.from_user.id] = "waiting_media_locator"
+    is_adm = message.from_user.id == client.admin_id
     await message.reply_text(
         "🎞 **媒体定位**\n\n"
         "如果目标消息不能复制链接、不能转发，就用这个功能。\n\n"
         "请输入：`频道ID 扫描数量`\n"
         "例如：`-1001234567890 100`\n\n"
-        "我会用用户号扫描最近消息，列出视频/文件的 **消息 ID**，并给出下载按钮。",
-        reply_markup=ForceReply(placeholder="例如: -1001234567890 100")
+        "我会用用户号扫描最近消息，列出视频/文件的 **消息 ID**，并给出下载按钮。\n\n"
+        "发 `取消` 或点 **❌ 取消操作** 可退出。",
+        reply_markup=get_cancel_keyboard(is_adm)
     )
     message.stop_propagation()
 
@@ -2523,6 +2547,7 @@ async def sub_media_locator_handler(client, message):
 async def sub_start_download_handler(client, message):
     from pyrogram.types import ForceReply
     user_interaction_state[message.from_user.id] = "waiting_dl_id_limit"
+    is_adm = message.from_user.id == client.admin_id
     await message.reply_text(
         "📥 **批量下载**\n\n"
         "最简单：复制目标视频的消息链接直接发给我。\n"
@@ -2535,8 +2560,9 @@ async def sub_start_download_handler(client, message):
         "   例如：`-1001234567890 50`\n\n"
         "2. 精准下载消息：`频道ID 消息ID 数量`\n"
         "   例如：`-1001234567890 4567 1`\n\n"
-        "💡 使用 \"📋 最近对话\" 可以查看频道ID",
-        reply_markup=ForceReply(placeholder="消息链接 / 频道ID 数量 / 频道ID 消息ID 数量")
+        "💡 使用 \"📋 最近对话\" 可以查看频道ID\n"
+        "发 `取消` 或点 **❌ 取消操作** 可退出。",
+        reply_markup=get_cancel_keyboard(is_adm)
     )
     message.stop_propagation()
 
@@ -2545,8 +2571,8 @@ async def menu_storage_handler(client, message):
     from pyrogram.types import ReplyKeyboardMarkup, KeyboardButton
     buttons = [
         [KeyboardButton("📂 我的合集"), KeyboardButton("🆕 新建合集")],
-        [KeyboardButton("� 查找文件"), KeyboardButton("📊 统计信息")],
-        [KeyboardButton("�🔙 返回主菜单")]
+        [KeyboardButton("🔍 查找文件"), KeyboardButton("📊 统计信息")],
+        [KeyboardButton("❌ 取消操作"), KeyboardButton("🔙 返回主菜单")]
     ]
     await message.reply_text(
         "☁️ **存储中心**\n\n"
@@ -2636,6 +2662,15 @@ async def sub_admin_stats(client, message):
 @Client.on_message(filters.regex("🔙 返回主菜单") & filters.private, group=-3)
 async def back_to_main(client, message):
     from handlers.setup import send_main_menu
+    await clear_user_state(message.from_user.id)
+    await send_main_menu(client, message)
+    message.stop_propagation()
+
+@Client.on_message((filters.regex(r"^(❌ 取消操作|取消|cancel|/cancel)$", re.IGNORECASE)) & filters.private, group=-4)
+async def cancel_text_handler(client, message):
+    from handlers.setup import send_main_menu
+    await clear_user_state(message.from_user.id)
+    await message.reply_text("✅ 已取消当前操作。")
     await send_main_menu(client, message)
     message.stop_propagation()
 
@@ -2665,7 +2700,9 @@ async def download_state_handler(client, message):
         except Exception:
             await message.reply_text(
                 "❌ 格式错误！请输入：`频道ID 扫描数量`\n"
-                "例如：`-1001234567890 100`"
+                "例如：`-1001234567890 100`\n\n"
+                "也可以点 **❌ 取消操作** 或 **🔙 返回主菜单**。",
+                reply_markup=get_cancel_keyboard(message.from_user.id == client.admin_id)
             )
             message.stop_propagation()
             return
@@ -2687,8 +2724,9 @@ async def download_state_handler(client, message):
                 "最简单：复制目标视频消息链接直接发给我。\n"
                 "消息 ID 是链接最后一段数字。\n\n"
                 "例：`https://t.me/c/1234567890/4567`\n"
-                "也可以输入：`频道ID 数量` 或 `频道ID 消息ID 数量`",
-                reply_markup=get_main_menu_keyboard(is_adm)
+                "也可以输入：`频道ID 数量` 或 `频道ID 消息ID 数量`\n\n"
+                "点 **❌ 取消操作** 可退出当前输入。",
+                reply_markup=get_cancel_keyboard(is_adm)
             )
             return
         
@@ -3204,9 +3242,9 @@ async def admin_stats_cmd(client: Client, message: Message):
 @Client.on_message(filters.command("cancel") & filters.private)
 async def cancel_cmd(client: Client, message: Message):
     """取消当前操作，返回主菜单"""
+    await clear_user_state(message.from_user.id)
     await message.reply_text(
-        "🚫 操作已取消。",
-        reply_markup=None # Remove ForceReply ifany
+        "✅ 操作已取消。"
     )
     from handlers.setup import send_main_menu
     await send_main_menu(client, message)

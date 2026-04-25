@@ -68,19 +68,22 @@ async def main():
     # 设置机器人菜单命令
     from pyrogram.types import BotCommand, BotCommandScopeDefault, BotCommandScopeChat, BotCommandScopeAllPrivateChats
     try:
-        # 1. 设置普通用户的菜单 (清空，仅使用按钮导航)
-        public_commands = []  # Empty - use buttons only
+        # 1. 设置普通用户的命令菜单。Reply Keyboard 仍然是主导航，这里作为兜底入口。
+        public_commands = [
+            BotCommand("start", "显示主菜单"),
+            BotCommand("cancel", "取消当前操作"),
+        ]
         await bot.set_bot_commands(public_commands, scope=BotCommandScopeAllPrivateChats())        # 同时设置 Default 以防万一
         await bot.set_bot_commands(public_commands, scope=BotCommandScopeDefault())
         
         # 2. 设置管理员的菜单 (精简版)
         admin_commands = public_commands + [
-             # BotCommand("users", "用户管理 | /users"),
+             BotCommand("download", "批量下载"),
+             BotCommand("recent", "最近对话"),
+             BotCommand("getid", "解析频道/消息ID"),
+             BotCommand("stats", "统计信息"),
         ]
-        # Clear Commands for Admin so they use Panel?
-        # User requested "Don't show commands in menu".
-        # I will keep empty list for Admin chat scope to force using Reply Keyboard.
-        await bot.set_bot_commands([], scope=BotCommandScopeChat(chat_id=ADMIN_ID))
+        await bot.set_bot_commands(admin_commands, scope=BotCommandScopeChat(chat_id=ADMIN_ID))
 
         print("✅ 机器人菜单命令已更新")
     except Exception as e:
