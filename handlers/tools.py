@@ -1167,11 +1167,38 @@ def _short_text(text, max_len=36):
         return text
     return text[: max_len - 1] + "…"
 
-async def show_recent_media_ids(client, message, chat_id, scan_limit=100):
+def _message_content_preview(msg):
+    return (
+        getattr(msg, "caption", None)
+        or getattr(msg, "text", None)
+        or getattr(msg, "media_caption", None)
+        or ""
+    )
+
+def _message_sender_name(msg):
+    if getattr(msg, "from_user", None):
+        user = msg.from_user
+        name = " ".join(part for part in [user.first_name, user.last_name] if part)
+        if user.username:
+            return f"{name or user.username} (@{user.username})"
+        return name or str(user.id)
+    if getattr(msg, "sender_chat", None):
+        return msg.sender_chat.title or str(msg.sender_chat.id)
+    return "未知发送者"
+
+def _message_time_text(msg):
+    if not getattr(msg, "date", None):
+        return "未知时间"
+    return msg.date.strftime("%m-%d %H:%M")
+
+async def show_recent_media_ids(client, message, chat_id, scan_limit=100, keyword=None):
     """List recent media message IDs for chats where copying links/forwarding is unavailable."""
     user = client.user_client
     scan_limit = max(1, min(scan_limit, 500))
-    status_msg = await message.reply_text(f"🔎 正在扫描 `{chat_id}` 最近 {scan_limit} 条消息...")
+    keyword = (keyword or "").strip()
+    keyword_lower = keyword.lower()
+    filter_text = f"\n🔍 关键词: `{keyword}`" if keyword else ""
+    status_msg = await message.reply_text(f"🔎 正在扫描 `{chat_id}` 最近 {scan_limit} 条消息...{filter_text}")
 
     try:
         await user.get_chat(chat_id)
@@ -1187,6 +1214,10 @@ async def show_recent_media_ids(client, message, chat_id, scan_limit=100):
             if not media_info:
                 continue
             file_name, file_size, mime_type = media_info
+            content_preview = _message_content_preview(msg)
+            searchable = f"{file_name}\n{content_preview}\n{_message_sender_name(msg)}".lower()
+            if keyword_lower and keyword_lower not in searchable:
+                continue
             if msg.video:
                 media_type = "视频"
             elif msg.document:
@@ -1197,7 +1228,16 @@ async def show_recent_media_ids(client, message, chat_id, scan_limit=100):
                 media_type = "音频"
             else:
                 media_type = "媒体"
-            rows.append((msg.id, media_type, file_name, file_size, mime_type))
+            rows.append((
+                msg.id,
+                media_type,
+                file_name,
+                file_size,
+                mime_type,
+                _message_sender_name(msg),
+                _message_time_text(msg),
+                content_preview,
+            ))
             if len(rows) >= 10:
                 break
     except Exception as e:
@@ -1209,23 +1249,27 @@ async def show_recent_media_ids(client, message, chat_id, scan_limit=100):
 
     if not rows:
         await status_msg.edit_text(
-            f"❌ 最近 {scanned} 条消息里没有找到视频或文件。\n\n"
-            "可以把扫描数量调大，例如：`-1001234567890 300`"
+            f"❌ 最近 {scanned} 条消息里没有找到匹配的视频或文件。\n\n"
+            "可以把扫描数量调大，或去掉关键词。\n"
+            "例如：`-1001234567890 300`"
         )
         return
 
     text = (
         f"🎞 **最近媒体定位**\n\n"
         f"频道: `{chat_id}`\n"
-        f"已扫描: {scanned} 条\n\n"
+        f"已扫描: {scanned} 条{filter_text}\n\n"
     )
     keyboard = []
-    for msg_id, media_type, file_name, file_size, mime_type in rows:
+    for msg_id, media_type, file_name, file_size, mime_type, sender, time_text, content_preview in rows:
         size_text = human_size(file_size)
         text += (
-            f"• `{msg_id}` | {media_type} | {size_text}\n"
-            f"  `{_short_text(file_name, 42)}`\n"
+            f"• `{msg_id}` | {media_type} | {size_text} | {time_text}\n"
+            f"  发送: `{_short_text(sender, 30)}`\n"
+            f"  文件: `{_short_text(file_name, 42)}`\n"
         )
+        if content_preview:
+            text += f"  内容: `{_short_text(content_preview, 70)}`\n"
         keyboard.append([
             InlineKeyboardButton(
                 f"⬇️ 下载 {msg_id}",
@@ -2537,7 +2581,9 @@ async def sub_media_locator_handler(client, message):
         "如果目标消息不能复制链接、不能转发，就用这个功能。\n\n"
         "请输入：`频道ID 扫描数量`\n"
         "例如：`-1001234567890 100`\n\n"
-        "我会用用户号扫描最近消息，列出视频/文件的 **消息 ID**，并给出下载按钮。\n\n"
+        "也可以加关键词过滤：`频道ID 扫描数量 关键词`\n"
+        "例如：`-1001234567890 300 第12集`\n\n"
+        "我会用用户号扫描最近消息，列出 **消息 ID、发送人、时间、文件名、消息内容/说明**，并给出下载按钮。\n\n"
         "发 `取消` 或点 **❌ 取消操作** 可退出。",
         reply_markup=get_cancel_keyboard(is_adm)
     )
@@ -2697,10 +2743,12 @@ async def download_state_handler(client, message):
         try:
             chat_id = int(parts[0])
             scan_limit = int(parts[1]) if len(parts) > 1 else 100
+            keyword = " ".join(parts[2:]) if len(parts) > 2 else None
         except Exception:
             await message.reply_text(
-                "❌ 格式错误！请输入：`频道ID 扫描数量`\n"
-                "例如：`-1001234567890 100`\n\n"
+                "❌ 格式错误！请输入：`频道ID 扫描数量` 或 `频道ID 扫描数量 关键词`\n"
+                "例如：`-1001234567890 100`\n"
+                "例如：`-1001234567890 300 第12集`\n\n"
                 "也可以点 **❌ 取消操作** 或 **🔙 返回主菜单**。",
                 reply_markup=get_cancel_keyboard(message.from_user.id == client.admin_id)
             )
@@ -2708,7 +2756,7 @@ async def download_state_handler(client, message):
             return
 
         del user_interaction_state[uid]
-        await show_recent_media_ids(client, message, chat_id, scan_limit)
+        await show_recent_media_ids(client, message, chat_id, scan_limit, keyword=keyword)
         message.stop_propagation()
         return
     
