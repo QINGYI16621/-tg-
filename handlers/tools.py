@@ -205,6 +205,21 @@ from datetime import datetime, timedelta
 # User Request History for Rate Limiting
 user_request_history = {}
 
+def is_admin_user(client, user_id):
+    return user_id == getattr(client, "admin_id", None)
+
+async def require_admin(client, event, alert=False):
+    user = getattr(event, "from_user", None)
+    user_id = getattr(user, "id", None)
+    if is_admin_user(client, user_id):
+        return True
+
+    if alert and hasattr(event, "answer"):
+        await event.answer("⛔ 此功能仅限管理员使用。", show_alert=True)
+    elif hasattr(event, "reply_text"):
+        await event.reply_text("⛔ 此功能仅限管理员使用。")
+    return False
+
 def get_cancel_keyboard(is_admin_user=False):
     buttons = [[KeyboardButton("❌ 取消操作"), KeyboardButton("🔙 返回主菜单")]]
     if is_admin_user:
@@ -315,9 +330,7 @@ async def list_recent_chats(client: Client, message: Message):
     List recent chats with pagination and category filter.
     管理员专用命令
     """
-    # 管理员检查
-    if message.from_user.id != client.admin_id:
-        await message.reply_text("⛔ 此命令仅限管理员使用。")
+    if not await require_admin(client, message):
         return
     
     user = client.user_client
@@ -372,8 +385,7 @@ async def search_chats(client: Client, message: Message):
     """
     from pyrogram.types import ForceReply
     
-    # 权限检查
-    if message.from_user.id != client.admin_id:
+    if not await require_admin(client, message):
         return
 
     args = message.command or []
@@ -467,9 +479,7 @@ async def do_search(client, message, keyword):
 @Client.on_message(filters.command("deleted") & filters.private)
 async def find_deleted_accounts(client: Client, message: Message):
     """Specifically scan for deleted/banned account chats. 管理员专用"""
-    # 管理员检查
-    if message.from_user.id != client.admin_id:
-        await message.reply_text("⛔ 此命令仅限管理员使用。")
+    if not await require_admin(client, message):
         return
     
     user = client.user_client
@@ -577,6 +587,8 @@ async def show_dialogs_page(message, dialogs_list, page=0, filter_type="ALL"):
 @Client.on_callback_query(filters.regex(r"^dlg_(filter|page)_"))
 async def dialogs_callback(client: Client, callback: CallbackQuery):
     """Handle pagination and filter button clicks."""
+    if not await require_admin(client, callback, alert=True):
+        return
     dialogs_list = user_dialogs_cache.get(callback.from_user.id, [])
     
     if not dialogs_list:
@@ -601,8 +613,8 @@ async def dialogs_callback(client: Client, callback: CallbackQuery):
 @Client.on_message(filters.command("getid") & filters.private)
 async def get_chat_id(client: Client, message: Message):
     """Get chat ID from a forwarded message. 管理员专用"""
-    # 管理员检查
-    # 权限检查 (开放给所有用户)
+    if not await require_admin(client, message):
+        return
     if not await check_auth(client, message):
         return
     
@@ -702,8 +714,8 @@ async def get_chat_id(client: Client, message: Message):
 @Client.on_message(filters.command("linked") & filters.private)
 async def get_linked_chat(client: Client, message: Message):
     """Get linked discussion group. 管理员专用"""
-    # 管理员检查
-    # 权限检查 (开放给所有用户)
+    if not await require_admin(client, message):
+        return
     if not await check_auth(client, message):
         return
     
@@ -768,7 +780,8 @@ async def batch_download(client: Client, message: Message):
       /download <chat_id> <limit>
       /download <chat_id> <start_message_id> <limit>
     """
-    # 权限检查
+    if not await require_admin(client, message):
+        return
     if not await check_auth(client, message):
         return
 
@@ -804,6 +817,8 @@ async def batch_download(client: Client, message: Message):
 @Client.on_callback_query(filters.regex(r"^dl_dest_(channel|saved)$"))
 async def download_dest_callback(client: Client, callback: CallbackQuery):
     """Handle destination selection."""
+    if not await require_admin(client, callback, alert=True):
+        return
     dest = callback.data.replace("dl_dest_", "")
     user_download_dest[callback.from_user.id] = dest
     
@@ -1296,6 +1311,8 @@ def human_size(size):
 
 @Client.on_callback_query(filters.regex(r"^dlmsg_"))
 async def download_located_media_callback(client, callback: CallbackQuery):
+    if not await require_admin(client, callback, alert=True):
+        return
     try:
         _, chat_id_text, msg_id_text = callback.data.split("_", 2)
         chat_id = int(chat_id_text)
@@ -2558,21 +2575,29 @@ async def menu_download_handler(client, message):
 # Sub-handlers for batch download sub-menu
 @Client.on_message(filters.regex("📋 最近对话") & filters.private, group=-3)
 async def sub_recent_handler(client, message):
+    if not await require_admin(client, message):
+        return
     await list_recent_chats(client, message)
     message.stop_propagation()
 
 @Client.on_message(filters.regex("🔍 搜索对话") & filters.private, group=-3)
 async def sub_search_handler(client, message):
+    if not await require_admin(client, message):
+        return
     await search_chats(client, message)
     message.stop_propagation()
 
 @Client.on_message(filters.regex("👻 删除账户") & filters.private, group=-3)
 async def sub_deleted_handler(client, message):
+    if not await require_admin(client, message):
+        return
     await find_deleted_accounts(client, message)
     message.stop_propagation()
 
 @Client.on_message(filters.regex("🎞 媒体定位") & filters.private, group=-3)
 async def sub_media_locator_handler(client, message):
+    if not await require_admin(client, message):
+        return
     from pyrogram.types import ForceReply
     user_interaction_state[message.from_user.id] = "waiting_media_locator"
     is_adm = message.from_user.id == client.admin_id
@@ -2591,6 +2616,8 @@ async def sub_media_locator_handler(client, message):
 
 @Client.on_message(filters.regex("📥 开始下载") & filters.private, group=-3)
 async def sub_start_download_handler(client, message):
+    if not await require_admin(client, message):
+        return
     from pyrogram.types import ForceReply
     user_interaction_state[message.from_user.id] = "waiting_dl_id_limit"
     is_adm = message.from_user.id == client.admin_id
@@ -2739,6 +2766,10 @@ async def download_state_handler(client, message):
     state = user_interaction_state.get(uid)
 
     if state == "waiting_media_locator":
+        if not await require_admin(client, message):
+            await clear_user_state(uid)
+            message.stop_propagation()
+            return
         parts = message.text.strip().split()
         try:
             chat_id = int(parts[0])
@@ -2762,6 +2793,10 @@ async def download_state_handler(client, message):
     
     # Handle original format: channel_id limit
     if state == "waiting_dl_id_limit":
+        if not await require_admin(client, message):
+            await clear_user_state(uid)
+            message.stop_propagation()
+            return
         try:
             chat_id, start_message_id, limit = await _parse_download_source(client, message.text)
         except Exception:
@@ -2790,6 +2825,10 @@ async def download_state_handler(client, message):
     # Handle link-based format (for backwards compatibility if ever needed)
     if state != "waiting_dl_link":
         message.continue_propagation()
+        return
+    if not await require_admin(client, message):
+        await clear_user_state(uid)
+        message.stop_propagation()
         return
     # Check if text exists
     if not message.text:
@@ -2894,6 +2933,8 @@ async def download_state_handler(client, message):
 
 @Client.on_callback_query(filters.regex(r"^startdl_"))
 async def start_download_btn(client, callback):
+    if not await require_admin(client, callback, alert=True):
+        return
     parts = callback.data.split("_")
     chat_id = int(parts[1])
     count = int(parts[2])
@@ -2952,6 +2993,8 @@ async def start_download_btn(client, callback):
 
 @Client.on_callback_query(filters.regex(r"^leavedl_"))
 async def leave_download_btn(client, callback):
+    if not await require_admin(client, callback, alert=True):
+        return
     chat_id = int(callback.data.split("_")[1])
     try:
         await client.storage_client.leave_chat(chat_id)
@@ -3019,12 +3062,16 @@ async def show_user_list(client, message, page=1):
 
 @Client.on_callback_query(filters.regex(r"^users_pg_"))
 async def users_page_callback(client, callback):
+    if not await require_admin(client, callback, alert=True):
+        return
     page = int(callback.data.split("_")[-1])
     await show_user_list(client, callback.message, page)
     await callback.answer()
 
 @Client.on_callback_query(filters.regex(r"^mng_u_"))
 async def manage_user_callback(client, callback):
+    if not await require_admin(client, callback, alert=True):
+        return
     uid = int(callback.data.split("_")[-1])
     from database import db
     user = db.get_user(uid)
@@ -3060,6 +3107,8 @@ async def manage_user_callback(client, callback):
 
 @Client.on_callback_query(filters.regex(r"^ban_u_"))
 async def execute_ban_callback(client, callback):
+    if not await require_admin(client, callback, alert=True):
+        return
     parts = callback.data.split("_")
     uid = int(parts[2])
     action = parts[3]

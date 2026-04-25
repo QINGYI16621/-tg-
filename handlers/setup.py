@@ -51,10 +51,9 @@ async def send_main_menu(client, message):
     # Check Admin
     is_adm = message.from_user.id == client.admin_id
     
-    buttons = [
-        [KeyboardButton("📥 批量下载"), KeyboardButton("☁️ 存储/上传")]
-    ]
+    buttons = [[KeyboardButton("☁️ 存储/上传")]]
     if is_adm:
+        buttons.insert(0, [KeyboardButton("📥 批量下载")])
         buttons.append([KeyboardButton("👮 管理员")])
     buttons.append([KeyboardButton("❌ 取消操作")])
         
@@ -70,10 +69,9 @@ async def send_main_menu(client, message):
 
 def get_main_menu_keyboard(is_admin_user=False):
     from pyrogram.types import ReplyKeyboardMarkup, KeyboardButton
-    buttons = [
-        [KeyboardButton("📥 批量下载"), KeyboardButton("☁️ 存储/上传")]
-    ]
+    buttons = [[KeyboardButton("☁️ 存储/上传")]]
     if is_admin_user:
+        buttons.insert(0, [KeyboardButton("📥 批量下载")])
         buttons.append([KeyboardButton("👮 管理员")])
     buttons.append([KeyboardButton("❌ 取消操作")])
     
@@ -103,11 +101,11 @@ async def terms_btn_callback(client: Client, callback):
     
     # 重新构造 Message 对象是不行的，我们直接发
     is_adm = callback.from_user.id == client.admin_id
-    buttons = [
-        [KeyboardButton("📥 批量下载"), KeyboardButton("☁️ 存储/上传")]
-    ]
+    buttons = [[KeyboardButton("☁️ 存储/上传")]]
     if is_adm:
+        buttons.insert(0, [KeyboardButton("📥 批量下载")])
         buttons.append([KeyboardButton("👮 管理员")])
+    buttons.append([KeyboardButton("❌ 取消操作")])
         
     await client.send_message(
         callback.message.chat.id,
