@@ -393,17 +393,16 @@ async def handle_reply_input(client: Client, message: Message):
     
     # 处理下载回复 (匹配新旧两种提示格式)
     elif ("频道ID" in prompt_text and "数量" in prompt_text) or "请按格式输入" in prompt_text:
-        parts = message.text.strip().split()
-        if len(parts) >= 2:
-            try:
-                chat_id = int(parts[0])
-                limit = int(parts[1])
-                dest = user_download_dest.get(message.from_user.id, "channel")
-                await do_batch_download(client, message, chat_id, limit, dest)
-            except ValueError:
-                await message.reply_text("❌ 格式错误！请输入：`频道ID 数量`\n例如：`-1001234567890 10`")
-        else:
-            await message.reply_text("❌ 格式错误！请输入：`频道ID 数量`\n例如：`-1001234567890 10`")
+        try:
+            chat_id, start_message_id, limit = await _parse_download_source(client, message.text)
+            dest = user_download_dest.get(message.from_user.id, "channel")
+            await do_batch_download(client, message, chat_id, limit, dest, start_message_id=start_message_id)
+        except Exception:
+            await message.reply_text(
+                "❌ 格式错误！\n\n"
+                "可以直接发消息链接，例如：`https://t.me/c/1234567890/4567`\n"
+                "或输入：`频道ID 数量` / `频道ID 消息ID 数量`"
+            )
     
     # 处理创建合集回复
     elif "请输入合集名称" in prompt_text:
@@ -600,16 +599,23 @@ async def get_chat_id(client: Client, message: Message):
         if match_private:
             id_part = match_private.group(1)
             full_id = int(f"-100{id_part}")
+            msg_match = re.search(r"t\.me/c/\d+/(\d+)", text)
+            message_id = int(msg_match.group(1)) if msg_match else None
+            message_line = f"💬 **消息 ID**: `{message_id}`\n" if message_id else ""
+            download_line = f"\n📥 **精准下载格式**: `{full_id} {message_id} 1`" if message_id else ""
             await message.reply_text(
                 f"✅ **通过链接解析**\n\n"
                 f"🔗 **链接**: `{text}`\n"
                 f"🆔 **ID**: `{full_id}`\n"
+                f"{message_line}"
                 f"📌 **类型**: 私有频道/群组 (计算推断)"
+                f"{download_line}"
             )
             return
 
         # B. 公开用户名/链接 t.me/username
         username = None
+        message_id = None
         if "t.me/" in text:
             # t.me/username/123 -> username
             parts = text.split("t.me/")
@@ -617,6 +623,8 @@ async def get_chat_id(client: Client, message: Message):
                 sub = parts[1].split("/")[0]
                 if sub and not sub.startswith("c"):
                     username = sub
+                    msg_match = re.search(r"t\.me/[^/\s]+/(\d+)", text)
+                    message_id = int(msg_match.group(1)) if msg_match else None
         elif text.startswith("@"):
             username = text[1:]
         elif not text.startswith("-100"): # not an ID
@@ -625,12 +633,16 @@ async def get_chat_id(client: Client, message: Message):
         if username:
             try:
                 chat = await client.get_chat(username)
+                message_line = f"💬 **消息 ID**: `{message_id}`\n" if message_id else ""
+                download_line = f"\n📥 **精准下载格式**: `{chat.id} {message_id} 1`" if message_id else ""
                 await message.reply_text(
                     f"✅ **成功获取！**\n\n"
                     f"📂 **名称**: {chat.title}\n"
                     f"🆔 **ID**: `{chat.id}`\n"
+                    f"{message_line}"
                     f"🔗 **Username**: @{chat.username}\n"
                     f"📌 **类型**: {chat.type}"
+                    f"{download_line}"
                 )
                 return
             except Exception as e:
@@ -662,8 +674,10 @@ async def get_chat_id(client: Client, message: Message):
     await message.reply_text(
         "ℹ️ **使用方法**\n\n"
         "1. **回复**一条转发消息发送 `/getid`\n"
-        "2. 发送 `/getid 链接` (支持 t.me/c/xxxxx)\n"
+        "2. 发送 `/getid 消息链接` (支持 t.me/c/xxxxx/123)\n"
         "3. 发送 `/getid @用户名`\n\n"
+        "💡 消息 ID 是消息链接最后一段数字。\n"
+        "例如 `https://t.me/c/1234567890/4567` 的消息 ID 是 `4567`。\n\n"
         "💡 **如果连链接都没有？**\n"
         "试试用 `/linked 频道ID` 查询关联群组。"
     )
@@ -733,7 +747,9 @@ async def get_linked_chat(client: Client, message: Message):
 async def batch_download(client: Client, message: Message):
     """
     Batch download messages from a specific channel ID.
-    Usage: /download <chat_id> <limit>
+    Usage:
+      /download <chat_id> <limit>
+      /download <chat_id> <start_message_id> <limit>
     """
     # 权限检查
     if not await check_auth(client, message):
@@ -754,11 +770,16 @@ async def batch_download(client: Client, message: Message):
             return
 
         chat_id = int(args[1])
-        limit = int(args[2])
+        start_message_id = None
+        if len(args) >= 4:
+            start_message_id = int(args[2])
+            limit = int(args[3])
+        else:
+            limit = int(args[2])
         
         # 默认发到存储频道
         dest = user_download_dest.get(message.from_user.id, "channel")
-        await do_batch_download(client, message, chat_id, limit, dest)
+        await do_batch_download(client, message, chat_id, limit, dest, start_message_id=start_message_id)
         
     except Exception as e:
         await message.reply_text(f"❌ 发生严重错误: {e}")
@@ -776,13 +797,110 @@ async def download_dest_callback(client: Client, callback: CallbackQuery):
         f"📥 **批量下载**\n\n"
         f"✅ 已选择目的地：{dest_name}\n\n"
         f"**第二步：输入来源**\n"
-        f"请按格式输入：`频道ID 数量`\n"
-        f"例如：`-1001234567890 10`",
-        reply_markup=ForceReply(placeholder="输入: 频道ID 数量")
+        f"最简单：复制目标视频的消息链接直接发给我。\n"
+        f"消息 ID 就是链接最后一段数字。\n\n"
+        f"消息链接：`https://t.me/c/1234567890/4567`\n"
+        f"其中频道 ID 为 `-1001234567890`，消息 ID 为 `4567`\n\n"
+        f"扫描最近媒体：`频道ID 数量`\n"
+        f"精准下载某条消息：`频道ID 消息ID 数量`\n\n"
+        f"例如：`-1001234567890 10`\n"
+        f"例如：`-1001234567890 4567 1`",
+        reply_markup=ForceReply(placeholder="消息链接 / 频道ID 数量 / 频道ID 消息ID 数量")
     )
     await callback.answer(f"已选择: {dest_name}")
 
-async def do_batch_download(client, message, chat_id, limit, dest="channel"):
+def _safe_download_name(file_name, fallback):
+    """Sanitize Telegram filenames for local temp paths."""
+    file_name = file_name or fallback
+    file_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", file_name)
+    file_name = file_name.strip().strip(".")
+    return file_name or fallback
+
+def _message_media_info(target_msg):
+    file_name = "unknown"
+    file_size = 0
+    mime_type = "application/octet-stream"
+
+    if target_msg.video:
+        file_name = target_msg.video.file_name or f"video_{target_msg.id}.mp4"
+        file_size = target_msg.video.file_size
+        mime_type = target_msg.video.mime_type or mime_type
+    elif target_msg.document:
+        file_name = target_msg.document.file_name or f"doc_{target_msg.id}"
+        file_size = target_msg.document.file_size
+        mime_type = target_msg.document.mime_type or mime_type
+    elif target_msg.photo:
+        file_name = f"photo_{target_msg.id}.jpg"
+        file_size = target_msg.photo.file_size
+        mime_type = "image/jpeg"
+    elif target_msg.audio:
+        file_name = target_msg.audio.file_name or f"audio_{target_msg.id}.mp3"
+        file_size = target_msg.audio.file_size
+        mime_type = target_msg.audio.mime_type or mime_type
+    else:
+        return None
+
+    return _safe_download_name(file_name, f"media_{target_msg.id}"), file_size or 0, mime_type
+
+def _download_error_hint(error):
+    error_text = str(error)
+    protected_markers = (
+        "CHAT_FORWARDS_RESTRICTED",
+        "FORWARDS_RESTRICTED",
+        "protected content",
+        "right forbidden",
+        "not enough rights",
+        "MEDIA_EMPTY",
+        "FILE_REFERENCE",
+    )
+    if any(marker.lower() in error_text.lower() for marker in protected_markers):
+        return "受保护内容/权限限制，当前账号无法通过 Telegram API 取回原文件"
+    return error_text[:120]
+
+async def _parse_download_source(client, text):
+    """
+    Parse download input.
+
+    Supported:
+    - -1001234567890 50
+    - -1001234567890 4567 1
+    - https://t.me/c/1234567890/4567
+    - https://t.me/channelname/4567
+    - https://t.me/channelname/4567 3
+    """
+    text = text.strip()
+
+    link_match = re.search(r"(?:https?://)?t\.me/(c/)?([^/\s]+)/(\d+)", text)
+    if link_match:
+        is_private = bool(link_match.group(1))
+        chat_part = link_match.group(2)
+        message_id = int(link_match.group(3))
+
+        trailing = text[link_match.end():].strip()
+        limit = 1
+        if trailing:
+            maybe_count = trailing.split()[0]
+            if maybe_count.isdigit():
+                limit = int(maybe_count)
+
+        if is_private:
+            chat_id = int(f"-100{chat_part}")
+        else:
+            chat = await client.user_client.get_chat(chat_part)
+            chat_id = chat.id
+
+        return chat_id, message_id, limit
+
+    parts = text.split()
+    if len(parts) < 2:
+        raise ValueError("格式错误")
+
+    chat_id = int(parts[0])
+    if len(parts) >= 3:
+        return chat_id, int(parts[1]), int(parts[2])
+    return chat_id, None, int(parts[1])
+
+async def do_batch_download(client, message, chat_id, limit, dest="channel", start_message_id=None):
     """Core download logic."""
     # Use User Client (Admin's account) for downloading
     user = client.user_client
@@ -792,7 +910,7 @@ async def do_batch_download(client, message, chat_id, limit, dest="channel"):
     
     if dest == "saved":
         # 发送到用户的 Saved Messages，用 user client
-        target_chat_id = message.from_user.id
+        target_chat_id = "me"
         dest_name = "⭐ 收藏夹"
         send_client = user
     else:
@@ -800,7 +918,8 @@ async def do_batch_download(client, message, chat_id, limit, dest="channel"):
         dest_name = "📁 存储频道"
         send_client = client
     
-    status_msg = await message.reply_text(f"🚀 开始扫描频道 `{chat_id}` 的最后 {limit} 条消息...\n📍 目的地: {dest_name}")
+    mode_text = f"从消息 `{start_message_id}` 精准读取 {limit} 条" if start_message_id else f"扫描最后 {limit} 个媒体"
+    status_msg = await message.reply_text(f"🚀 开始处理频道 `{chat_id}`\n🔎 模式: {mode_text}\n📍 目的地: {dest_name}")
     
     # Get history with error handling
     try:
@@ -812,19 +931,33 @@ async def do_batch_download(client, message, chat_id, limit, dest="channel"):
         
         messages_to_process = []
         scan_count = 0
-        # Scan up to 500 messages or 10x the limit to find media
-        max_scan = max(500, limit * 10)
-        
-        async for msg in user.get_chat_history(chat_id):
-            scan_count += 1
-            if msg.media:
-                messages_to_process.append(msg)
-            
-            if len(messages_to_process) >= limit:
-                break
-            
-            if scan_count >= max_scan:
-                break
+
+        if start_message_id:
+            # 精准模式：从指定消息 ID 往前取 N 条消息，适合已知视频消息 ID 的场景。
+            first_id = max(1, start_message_id - limit + 1)
+            message_ids = list(range(start_message_id, first_id - 1, -1))
+            fetched = await user.get_messages(chat_id, message_ids)
+            if not isinstance(fetched, list):
+                fetched = [fetched]
+            scan_count = len(fetched)
+            messages_to_process = [
+                msg for msg in fetched
+                if msg and not getattr(msg, "empty", False) and msg.media
+            ]
+        else:
+            # Scan up to 500 messages or 10x the limit to find media
+            max_scan = max(500, limit * 10)
+
+            async for msg in user.get_chat_history(chat_id):
+                scan_count += 1
+                if msg.media:
+                    messages_to_process.append(msg)
+
+                if len(messages_to_process) >= limit:
+                    break
+
+                if scan_count >= max_scan:
+                    break
                 
     except Exception as e:
         error_msg = str(e)
@@ -855,7 +988,8 @@ async def do_batch_download(client, message, chat_id, limit, dest="channel"):
         is_adm = message.from_user.id == client.admin_id
         try: await status_msg.delete()
         except: pass
-        await message.reply_text(f"❌ 未找到包含媒体文件的消息 (已扫描 {scan_count} 条)。", reply_markup=get_main_menu_keyboard(is_adm))
+        help_text = "请确认消息 ID 是否正确，或把数量设为 1 精准下载该条消息。" if start_message_id else "可以改用 `频道ID 消息ID 数量` 精准模式。"
+        await message.reply_text(f"❌ 未找到包含媒体文件的消息 (已检查 {scan_count} 条)。\n\n{help_text}", reply_markup=get_main_menu_keyboard(is_adm))
         return
 
     # Initialize Dashboard
@@ -873,6 +1007,7 @@ async def do_batch_download(client, message, chat_id, limit, dest="channel"):
     
     success_count = 0
     fail_count = 0
+    fail_reasons = []
     total_count = len(messages_to_process)
     
     # Process from oldest to newest
@@ -880,24 +1015,10 @@ async def do_batch_download(client, message, chat_id, limit, dest="channel"):
         current_idx = index + 1
         
         try:
-            # Determine file name & Update Dashboard
-            file_name = "unknown"
-            file_size = 0
-            
-            if target_msg.video:
-                file_name = target_msg.video.file_name or f"video_{target_msg.id}.mp4"
-                file_size = target_msg.video.file_size
-            elif target_msg.document:
-                file_name = target_msg.document.file_name or f"doc_{target_msg.id}"
-                file_size = target_msg.document.file_size
-            elif target_msg.photo:
-                file_name = f"photo_{target_msg.id}.jpg"
-                file_size = target_msg.photo.file_size
-            elif target_msg.audio:
-                file_name = target_msg.audio.file_name or f"audio_{target_msg.id}.mp3"
-                file_size = target_msg.audio.file_size
-            else:
+            media_info = _message_media_info(target_msg)
+            if not media_info:
                 continue
+            file_name, file_size, mime_type = media_info
 
             try:
                 await dashboard_msg.edit_text(
@@ -917,6 +1038,7 @@ async def do_batch_download(client, message, chat_id, limit, dest="channel"):
             
             if not dl_path:
                 fail_count += 1
+                fail_reasons.append(f"#{target_msg.id}: 下载返回空路径")
                 continue
 
             # 2. Encrypt
@@ -937,7 +1059,7 @@ async def do_batch_download(client, message, chat_id, limit, dest="channel"):
             
             # Primary Upload
             primary_msg = await send_client.send_document(
-                config.STORAGE_CHANNEL_ID,
+                target_chat_id,
                 enc_path,
                 caption=caption
             )
@@ -945,7 +1067,7 @@ async def do_batch_download(client, message, chat_id, limit, dest="channel"):
             # Backup Upload
             backup_msg_id = 0
             backup_chat_id = 0
-            if config.BACKUP_CHANNEL_ID and config.BACKUP_CHANNEL_ID != 0:
+            if dest == "channel" and config.BACKUP_CHANNEL_ID and config.BACKUP_CHANNEL_ID != 0:
                 try:
                     # Prefer using storage_client for backup if possible, or same client
                     backup_uploader = client.storage_client if hasattr(client, 'storage_client') else send_client
@@ -964,15 +1086,21 @@ async def do_batch_download(client, message, chat_id, limit, dest="channel"):
             access_key = ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(key_length))
             
             if primary_msg and primary_msg.document:
+                if dest == "saved":
+                    success_count += 1
+                    try: os.remove(enc_path)
+                    except: pass
+                    continue
+
                 db.add_file(
                     message_id=primary_msg.id,
-                    chat_id=config.STORAGE_CHANNEL_ID,
+                    chat_id=target_chat_id,
                     file_id=primary_msg.document.file_id,
                     file_unique_id=primary_msg.document.file_unique_id,
                     file_name=file_name,
                     caption="",
                     file_size=file_size,
-                    mime_type="application/octet-stream",
+                    mime_type=mime_type,
                     storage_mode='telegram_stealth',
                     access_key=access_key,
                     is_encrypted=True,
@@ -983,6 +1111,7 @@ async def do_batch_download(client, message, chat_id, limit, dest="channel"):
                 success_count += 1
             else:
                 fail_count += 1
+                fail_reasons.append(f"#{target_msg.id}: 上传后未返回 document")
             
             # Clean enc file
             try: os.remove(enc_path)
@@ -990,17 +1119,142 @@ async def do_batch_download(client, message, chat_id, limit, dest="channel"):
             
         except Exception as e:
             fail_count += 1
+            hint = _download_error_hint(e)
+            fail_reasons.append(f"#{getattr(target_msg, 'id', '?')}: {hint}")
             print(f"Batch file error: {e}")
-            
+
+    reason_text = ""
+    if fail_reasons:
+        reason_text = "\n\n⚠️ **失败明细（前5条）**\n" + "\n".join(f"- {item}" for item in fail_reasons[:5])
+
     await dashboard_msg.edit_text(
         f"✅ **批量任务结束**\n"
         f"📊 总数: {total_count}\n"
         f"✅ 成功: {success_count}\n"
         f"❌ 失败: {fail_count}\n"
-        f"📂 所有文件已加密存入保险箱。"
+        f"📂 目的地: {dest_name}"
+        f"{reason_text}"
     )
     
-    await message.reply_text(f"🎉 **批量任务结束！**\n共处理: {total_count}\n成功: {success_count}")
+    await message.reply_text(f"🎉 **批量任务结束！**\n共处理: {total_count}\n成功: {success_count}\n目的地: {dest_name}")
+
+
+def _short_text(text, max_len=36):
+    text = (text or "").replace("\n", " ").strip()
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 1] + "…"
+
+async def show_recent_media_ids(client, message, chat_id, scan_limit=100):
+    """List recent media message IDs for chats where copying links/forwarding is unavailable."""
+    user = client.user_client
+    scan_limit = max(1, min(scan_limit, 500))
+    status_msg = await message.reply_text(f"🔎 正在扫描 `{chat_id}` 最近 {scan_limit} 条消息...")
+
+    try:
+        await user.get_chat(chat_id)
+    except Exception:
+        pass
+
+    rows = []
+    scanned = 0
+    try:
+        async for msg in user.get_chat_history(chat_id, limit=scan_limit):
+            scanned += 1
+            media_info = _message_media_info(msg)
+            if not media_info:
+                continue
+            file_name, file_size, mime_type = media_info
+            if msg.video:
+                media_type = "视频"
+            elif msg.document:
+                media_type = "文件"
+            elif msg.photo:
+                media_type = "图片"
+            elif msg.audio:
+                media_type = "音频"
+            else:
+                media_type = "媒体"
+            rows.append((msg.id, media_type, file_name, file_size, mime_type))
+            if len(rows) >= 10:
+                break
+    except Exception as e:
+        await status_msg.edit_text(
+            f"❌ 扫描失败: `{e}`\n\n"
+            "请确认 vault_user 账号已经加入该频道/群组，并且频道 ID 正确。"
+        )
+        return
+
+    if not rows:
+        await status_msg.edit_text(
+            f"❌ 最近 {scanned} 条消息里没有找到视频或文件。\n\n"
+            "可以把扫描数量调大，例如：`-1001234567890 300`"
+        )
+        return
+
+    text = (
+        f"🎞 **最近媒体定位**\n\n"
+        f"频道: `{chat_id}`\n"
+        f"已扫描: {scanned} 条\n\n"
+    )
+    keyboard = []
+    for msg_id, media_type, file_name, file_size, mime_type in rows:
+        size_text = human_size(file_size)
+        text += (
+            f"• `{msg_id}` | {media_type} | {size_text}\n"
+            f"  `{_short_text(file_name, 42)}`\n"
+        )
+        keyboard.append([
+            InlineKeyboardButton(
+                f"⬇️ 下载 {msg_id}",
+                callback_data=f"dlmsg_{chat_id}_{msg_id}",
+            )
+        ])
+
+    text += (
+        "\n💡 消息 ID 就是左侧那串数字。\n"
+        "手动精准下载格式：`频道ID 消息ID 1`"
+    )
+    await status_msg.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+def human_size(size):
+    if not size:
+        return "未知大小"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    value = float(size)
+    unit_index = 0
+    while value >= 1024 and unit_index < len(units) - 1:
+        value /= 1024
+        unit_index += 1
+    return f"{value:.1f}{units[unit_index]}"
+
+@Client.on_callback_query(filters.regex(r"^dlmsg_"))
+async def download_located_media_callback(client, callback: CallbackQuery):
+    try:
+        _, chat_id_text, msg_id_text = callback.data.split("_", 2)
+        chat_id = int(chat_id_text)
+        msg_id = int(msg_id_text)
+    except Exception:
+        await callback.answer("按钮数据无效", show_alert=True)
+        return
+
+    await callback.answer("开始下载")
+
+    from types import SimpleNamespace
+
+    class MockMessage:
+        def __init__(self, bot_client, user_id):
+            self.chat = SimpleNamespace(id=user_id, type="private", title="User")
+            self.from_user = SimpleNamespace(id=user_id, is_bot=False, username="User", first_name="")
+            self._client = bot_client
+            self.text = f"{chat_id} {msg_id} 1"
+
+        async def reply_text(self, text, **kwargs):
+            return await self._client.send_message(self.chat.id, text, **kwargs)
+
+    dest = user_download_dest.get(callback.from_user.id, "channel")
+    mock_msg = MockMessage(client, callback.from_user.id)
+    await do_batch_download(client, mock_msg, chat_id, 1, dest, start_message_id=msg_id)
 
 
 # ========== 合集功能 ==========
@@ -1073,6 +1327,7 @@ async def do_create_collection(client, message, name):
             "status_chat_id": sent_msg.chat.id,
             "success": 0,
             "total": 0,
+            "fail": 0,
             "last_update": 0
         }
     else:
@@ -1751,7 +2006,8 @@ async def media_handler(client: Client, message: Message):
         except Exception as bot_err:
             # Bot 失败，使用闲置账号
             upload_method = "存储账号"
-            await status_msg.edit_text(f"⬆️ Bot上传失败，切换到存储账号...")
+            if status_msg:
+                await status_msg.edit_text(f"⬆️ Bot上传失败，切换到存储账号...")
             storage_client = client.storage_client
             storage_msg = await storage_client.send_document(
                 config.STORAGE_CHANNEL_ID,
@@ -2019,9 +2275,7 @@ async def picker_pagination_callback(client: Client, callback: CallbackQuery):
     access_key = "_".join(parts[2:-1])
     
     # 1. 获取文件名称以重建文本
-    db.cursor.execute('SELECT file_name FROM files WHERE access_key = ?', (access_key,))
-    row = db.cursor.fetchone()
-    file_name = row[0] if row else "未知文件"
+    file_name = db.get_file_name_by_access_key(access_key) or "未知文件"
     
     # 2. 获取总页数 (用于文本显示) 
     # 这里有点低效，但为了显示 "Page X/Y" 必须算一次
@@ -2215,7 +2469,8 @@ async def menu_download_handler(client, message):
     from pyrogram.types import ReplyKeyboardMarkup, KeyboardButton
     buttons = [
         [KeyboardButton("📋 最近对话"), KeyboardButton("🔍 搜索对话")],
-        [KeyboardButton("👻 删除账户"), KeyboardButton("📥 开始下载")],
+        [KeyboardButton("🎞 媒体定位"), KeyboardButton("📥 开始下载")],
+        [KeyboardButton("👻 删除账户")],
         [KeyboardButton("🔙 返回主菜单")]
     ]
     await message.reply_text(
@@ -2223,6 +2478,7 @@ async def menu_download_handler(client, message):
         "请选择操作：\n"
         "🔹 **最近对话**: 查看用户账号的最近对话列表\n"
         "🔹 **搜索对话**: 按关键词搜索对话\n"
+        "🔹 **媒体定位**: 无法复制链接时，扫描频道视频并显示消息ID\n"
         "🔹 **删除账户**: 查找已删除/封禁的账号\n"
         "🔹 **开始下载**: 输入链接或ID批量下载\n",
         reply_markup=ReplyKeyboardMarkup(
@@ -2249,17 +2505,38 @@ async def sub_deleted_handler(client, message):
     await find_deleted_accounts(client, message)
     message.stop_propagation()
 
+@Client.on_message(filters.regex("🎞 媒体定位") & filters.private, group=-3)
+async def sub_media_locator_handler(client, message):
+    from pyrogram.types import ForceReply
+    user_interaction_state[message.from_user.id] = "waiting_media_locator"
+    await message.reply_text(
+        "🎞 **媒体定位**\n\n"
+        "如果目标消息不能复制链接、不能转发，就用这个功能。\n\n"
+        "请输入：`频道ID 扫描数量`\n"
+        "例如：`-1001234567890 100`\n\n"
+        "我会用用户号扫描最近消息，列出视频/文件的 **消息 ID**，并给出下载按钮。",
+        reply_markup=ForceReply(placeholder="例如: -1001234567890 100")
+    )
+    message.stop_propagation()
+
 @Client.on_message(filters.regex("📥 开始下载") & filters.private, group=-3)
 async def sub_start_download_handler(client, message):
     from pyrogram.types import ForceReply
     user_interaction_state[message.from_user.id] = "waiting_dl_id_limit"
     await message.reply_text(
         "📥 **批量下载**\n\n"
-        "请输入 **频道ID** 和 **下载数量**。\n\n"
-        "格式: `频道ID 数量`\n"
-        "例如: `-1001234567890 50`\n\n"
+        "最简单：复制目标视频的消息链接直接发给我。\n"
+        "消息 ID 就是链接最后一段数字。\n\n"
+        "例：`https://t.me/c/1234567890/4567`\n"
+        "频道 ID：`-1001234567890`\n"
+        "消息 ID：`4567`\n\n"
+        "支持两种格式：\n\n"
+        "1. 扫描最近媒体：`频道ID 数量`\n"
+        "   例如：`-1001234567890 50`\n\n"
+        "2. 精准下载消息：`频道ID 消息ID 数量`\n"
+        "   例如：`-1001234567890 4567 1`\n\n"
         "💡 使用 \"📋 最近对话\" 可以查看频道ID",
-        reply_markup=ForceReply(placeholder="例如: -1001234567890 50")
+        reply_markup=ForceReply(placeholder="消息链接 / 频道ID 数量 / 频道ID 消息ID 数量")
     )
     message.stop_propagation()
 
@@ -2379,24 +2656,40 @@ async def download_state_handler(client, message):
 
     uid = message.from_user.id
     state = user_interaction_state.get(uid)
+
+    if state == "waiting_media_locator":
+        parts = message.text.strip().split()
+        try:
+            chat_id = int(parts[0])
+            scan_limit = int(parts[1]) if len(parts) > 1 else 100
+        except Exception:
+            await message.reply_text(
+                "❌ 格式错误！请输入：`频道ID 扫描数量`\n"
+                "例如：`-1001234567890 100`"
+            )
+            message.stop_propagation()
+            return
+
+        del user_interaction_state[uid]
+        await show_recent_media_ids(client, message, chat_id, scan_limit)
+        message.stop_propagation()
+        return
     
     # Handle original format: channel_id limit
     if state == "waiting_dl_id_limit":
-        
-        parts = message.text.strip().split()
-        if len(parts) < 2:
-            from handlers.setup import get_main_menu_keyboard
-            is_adm = message.from_user.id == client.admin_id
-            await message.reply_text("❌ 格式错误！请输入：`频道ID 数量`\n例如：`-1001234567890 50`", reply_markup=get_main_menu_keyboard(is_adm))
-            return
-        
         try:
-            chat_id = int(parts[0])
-            limit = int(parts[1])
-        except ValueError:
+            chat_id, start_message_id, limit = await _parse_download_source(client, message.text)
+        except Exception:
             from handlers.setup import get_main_menu_keyboard
             is_adm = message.from_user.id == client.admin_id
-            await message.reply_text("❌ ID 或数量必须是数字！请重试。\n或者点击下方按钮返回。", reply_markup=get_main_menu_keyboard(is_adm))
+            await message.reply_text(
+                "❌ 格式错误！\n\n"
+                "最简单：复制目标视频消息链接直接发给我。\n"
+                "消息 ID 是链接最后一段数字。\n\n"
+                "例：`https://t.me/c/1234567890/4567`\n"
+                "也可以输入：`频道ID 数量` 或 `频道ID 消息ID 数量`",
+                reply_markup=get_main_menu_keyboard(is_adm)
+            )
             return
         
         # Success! Consume state now
@@ -2404,7 +2697,7 @@ async def download_state_handler(client, message):
         
         # Use default destination (channel)
         dest = user_download_dest.get(uid, "channel")
-        await do_batch_download(client, message, chat_id, limit, dest)
+        await do_batch_download(client, message, chat_id, limit, dest, start_message_id=start_message_id)
         message.stop_propagation()
         return
     
@@ -2543,21 +2836,8 @@ async def start_download_btn(client, callback):
     # I will Refactor `do_batch_download` separately?
     # Or just spawn a task.
     
-    # Quick fix: Send a command message from the user? 
-    # `await client.send_message(user_id, f"/download {chat_id} {count}")`
-    # This works perfectly and reuses all logic!
-    
     await callback.answer("任务已提交")
-    # Simulate command
-    msg = await client.send_message(callback.from_user.id, f"/download {chat_id} {count}")
-    # We need to trigger the handler manually? 
-    # No, sending message to self (as bot) doesn't trigger bot handlers usually (bot seeing own message).
-    # Sending AS USER? Bot can't send as user.
-    
-    # We must REUSE Logic. 
-    # I will Execute the function manually.
-    
-    from handlers.tools import do_batch_download
+
     from types import SimpleNamespace
     
     # Mock Message
@@ -2573,7 +2853,8 @@ async def start_download_btn(client, callback):
             return await self._client.send_message(self.chat.id, text, **kwargs)
             
     mock_msg = MockMessage(client, chat_id, f"/download {chat_id} {count}", callback.from_user.id)
-    await do_batch_download(client, mock_msg)
+    dest = user_download_dest.get(callback.from_user.id, "channel")
+    await do_batch_download(client, mock_msg, chat_id, count, dest)
     
     if auto_leave:
         try:
@@ -2826,16 +3107,7 @@ async def find_cmd(client: Client, message: Message):
     # So finding USER'S files means: 
     # JOIN collections ON collection_files.collection_id = collections.id WHERE collections.owner_id = ? AND files.file_name LIKE ?
     
-    query = """
-        SELECT f.file_name, f.access_key, c.name 
-        FROM files f
-        JOIN collection_files cf ON f.id = cf.file_id
-        JOIN collections c ON cf.collection_id = c.id
-        WHERE c.owner_id = ? AND f.file_name LIKE ?
-        LIMIT 20
-    """
-    db.cursor.execute(query, (owner_id, f"%{keyword}%"))
-    rows = db.cursor.fetchall()
+    rows = db.search_user_files(owner_id, keyword, limit=20)
     
     if not rows:
         await message.reply_text(f"❌ 未找到包含 **{keyword}** 的文件。")
@@ -2843,8 +3115,7 @@ async def find_cmd(client: Client, message: Message):
         
     text = f"🔍 **搜索结果: {keyword}**\n\n"
     for r in rows:
-        fname, key, cname = r
-        text += f"📄 `{fname}`\n   └ 📁 {cname} | 🔑 `{key}`\n"
+        text += f"📄 `{r['file_name']}`\n   └ 📁 {r['collection_name']} | 🔑 `{r['access_key']}`\n"
         
     await message.reply_text(text)
 
@@ -2887,16 +3158,7 @@ async def search_reply_handler(client: Client, message: Message):
          from database import db
          owner_id = message.from_user.id
          
-         query = """
-            SELECT f.file_name, f.access_key, c.name 
-            FROM files f
-            JOIN collection_files cf ON f.id = cf.file_id
-            JOIN collections c ON cf.collection_id = c.id
-            WHERE c.owner_id = ? AND f.file_name LIKE ?
-            LIMIT 20
-         """
-         db.cursor.execute(query, (owner_id, f"%{keyword}%"))
-         rows = db.cursor.fetchall()
+         rows = db.search_user_files(owner_id, keyword, limit=20)
         
          if not rows:
             await message.reply_text(f"❌ 未找到包含 **{keyword}** 的文件。")
@@ -2904,8 +3166,7 @@ async def search_reply_handler(client: Client, message: Message):
             
          text = f"🔍 **搜索结果: {keyword}**\n\n"
          for r in rows:
-            fname, key, cname = r
-            text += f"📄 `{fname}`\n   └ 📁 {cname} | 🔑 `{key}`\n"
+            text += f"📄 `{r['file_name']}`\n   └ 📁 {r['collection_name']} | 🔑 `{r['access_key']}`\n"
             
          await message.reply_text(text)
 

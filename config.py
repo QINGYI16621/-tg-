@@ -1,77 +1,108 @@
 import os
+from pathlib import Path
+
 from dotenv import load_dotenv
 
-# 加载 .env 文件 (如果存在)
 load_dotenv()
 
-# ======== 安全配置 ========
-# 敏感信息从环境变量读取，部署时设置环境变量
 
-# Telegram API Credentials
-API_ID = int(os.getenv("TG_API_ID", "123456"))
-API_HASH = os.getenv("TG_API_HASH", "cx2241....")
+def _get_int(name, default=0):
+    raw_value = os.getenv(name, str(default)).strip()
+    if not raw_value:
+        return default
+    try:
+        return int(raw_value)
+    except ValueError:
+        return default
 
-# Bot Token (From @BotFather)
-BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11")
 
-# Storage Configuration
-STORAGE_CHANNEL_ID = int(os.getenv("TG_STORAGE_CHANNEL", "-100xxxxxxxxxx"))
-BACKUP_CHANNEL_ID = int(os.getenv("TG_BACKUP_CHANNEL", "-1003481008336"))
+def _get_bool(name, default=False):
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
 
-# Database Configuration
-DB_NAME = os.getenv("DB_NAME", "vault.db")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "change_this_to_a_strong_password")
 
-# Encryption Configuration
-# 必须设置，否则无法加密/解密
-ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "")
+def _get_int_set(name):
+    raw_value = os.getenv(name, "")
+    values = set()
+    for item in raw_value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            values.add(int(item))
+        except ValueError:
+            pass
+    return values
 
-# VPS Temporary Storage Path
-TEMP_DOWNLOAD_DIR = os.getenv("TEMP_DIR", "/tmp/telegram_vault_tmp")
 
-# ======== 存储配置 ========
+# ======== Telegram 配置 ========
+API_ID = _get_int("TG_API_ID")
+API_HASH = os.getenv("TG_API_HASH", "").strip()
+BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
 
-# 存储模式选择:
-# 1. 'telegram_stealth' (⭐ 推荐): 
-#    存回 Telegram 频道，但会自动混淆 Hash 和加密文件名，
-#    防止被检测和封禁，无限容量，免费，0 VPS流量。
-# 2. 'local' (本地): 存 VPS 硬盘或挂载盘。
-# 3. 's3' (对象存储): 存 R2/AWS。
+# 频道 ID 必须是 -100 开头的整数。未配置时保持 0，启动时给出友好提示。
+STORAGE_CHANNEL_ID = _get_int("TG_STORAGE_CHANNEL")
+BACKUP_CHANNEL_ID = _get_int("TG_BACKUP_CHANNEL")
 
-STORAGE_MODE = os.getenv("STORAGE_MODE", "telegram_stealth")
+# ======== 数据库与加密配置 ========
+DB_NAME = os.getenv("DB_NAME", "vault.db").strip() or "vault.db"
+DB_PASSWORD = os.getenv("DB_PASSWORD", "").strip()
+ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "").strip()
 
-# 1. 本地存储配置
-LOCAL_STORAGE_PATH = os.getenv("LOCAL_STORAGE_PATH", os.path.join(os.getcwd(), "Storage"))
-if not os.path.exists(LOCAL_STORAGE_PATH):
-    os.makedirs(LOCAL_STORAGE_PATH, exist_ok=True)
+# ======== 临时目录与存储配置 ========
+TEMP_DOWNLOAD_DIR = os.getenv("TEMP_DIR", "/tmp/telegram_vault_tmp").strip()
+STORAGE_MODE = os.getenv("STORAGE_MODE", "telegram_stealth").strip()
 
-# 2. S3 对象存储配置 (Cloudflare R2 / AWS S3)
-S3_ENDPOINT_URL = os.getenv("S3_ENDPOINT_URL", "") # 例如: https://<account_id>.r2.cloudflarestorage.com
-S3_ACCESS_KEY = os.getenv("S3_ACCESS_KEY", "")
-S3_SECRET_KEY = os.getenv("S3_SECRET_KEY", "")
-S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME", "telegram-vault")
-S3_PUBLIC_DOMAIN = os.getenv("S3_PUBLIC_DOMAIN", "") # (可选) 绑定的自定义域名
+LOCAL_STORAGE_PATH = os.getenv(
+    "LOCAL_STORAGE_PATH",
+    str(Path.cwd() / "Storage"),
+).strip()
+if STORAGE_MODE == "local":
+    Path(LOCAL_STORAGE_PATH).mkdir(parents=True, exist_ok=True)
+
+# ======== S3 / R2 配置 ========
+S3_ENDPOINT_URL = os.getenv("S3_ENDPOINT_URL", "").strip()
+S3_ACCESS_KEY = os.getenv("S3_ACCESS_KEY", "").strip()
+S3_SECRET_KEY = os.getenv("S3_SECRET_KEY", "").strip()
+S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME", "telegram-vault").strip()
+S3_PUBLIC_DOMAIN = os.getenv("S3_PUBLIC_DOMAIN", "").strip()
 
 # ======== Web 播放服务配置 ========
-ENABLE_WEB_SERVER = True
-WEB_SERVER_HOST = os.getenv("WEB_SERVER_HOST", "0.0.0.0")
-WEB_SERVER_PORT = int(os.getenv("WEB_SERVER_PORT", 8080))
-# 你的服务器公网 IP 或域名 (用于生成播放链接)
-WEB_PUBLIC_HOST = os.getenv("WEB_PUBLIC_HOST", "127.0.0.1:8080")
+ENABLE_WEB_SERVER = _get_bool("ENABLE_WEB_SERVER", True)
+WEB_SERVER_HOST = os.getenv("WEB_SERVER_HOST", "0.0.0.0").strip()
+WEB_SERVER_PORT = _get_int("WEB_SERVER_PORT", 8080)
+WEB_PUBLIC_HOST = os.getenv("WEB_PUBLIC_HOST", "127.0.0.1:8080").strip()
 
 # ======== 安全限制 ========
+ADMIN_ID = _get_int("ADMIN_ID")
+BLACKLIST = _get_int_set("BLACKLIST")
+RATE_LIMIT_SECONDS = _get_int("RATE_LIMIT_SECONDS", 5)
+MAX_DOWNLOAD_COUNT = _get_int("MAX_DOWNLOAD_COUNT", 50)
+AUTO_JOIN_REQUIRE_APPROVAL = _get_bool("AUTO_JOIN_REQUIRE_APPROVAL", True)
 
-# 管理员 ID
-ADMIN_ID = int(os.getenv("ADMIN_ID", "123456789"))
 
-# 黑名单用户 ID（被封禁的用户）
-BLACKLIST = set(map(int, os.getenv("BLACKLIST", "").split(","))) if os.getenv("BLACKLIST") else set()
+def validate_config():
+    """启动前校验必需配置，避免机器人运行到一半才报隐晦错误。"""
+    errors = []
 
-# 频率限制（秒）
-RATE_LIMIT_SECONDS = 5  # 每个用户两次操作之间最少间隔
+    if API_ID <= 0:
+        errors.append("TG_API_ID 未配置或不是数字")
+    if not API_HASH:
+        errors.append("TG_API_HASH 未配置")
+    if not BOT_TOKEN or ":" not in BOT_TOKEN:
+        errors.append("TG_BOT_TOKEN 未配置或格式不正确")
+    if ADMIN_ID <= 0:
+        errors.append("ADMIN_ID 未配置或不是数字")
+    if STORAGE_CHANNEL_ID == 0:
+        errors.append("TG_STORAGE_CHANNEL 未配置或不是有效频道 ID")
+    if not ENCRYPTION_KEY or ENCRYPTION_KEY == "CHANGE_THIS_TO_RANDOM_STRING_43_CHARS":
+        errors.append("ENCRYPTION_KEY 必须设置为随机强密码")
 
-# 下载限制
-MAX_DOWNLOAD_COUNT = 50  # 单次批量下载最大数量
-
-# 自动加入频道是否需要管理员审批
-AUTO_JOIN_REQUIRE_APPROVAL = True
+    if errors:
+        joined = "\n - ".join(errors)
+        raise RuntimeError(
+            "配置不完整，请先复制 .env.example 为 .env 并补齐以下项目：\n"
+            f" - {joined}"
+        )

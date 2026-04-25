@@ -30,7 +30,9 @@ if not os.path.exists("handlers/__init__.py"):
 
 async def main():
     # 导入安全配置
-    from config import ADMIN_ID
+    from config import ADMIN_ID, validate_config
+
+    validate_config()
     
     # 1. Initialize the Bot Client
     bot = Client(

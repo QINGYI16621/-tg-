@@ -64,8 +64,6 @@ async def send_main_menu(client, message):
         "🔐 **数据安全**: 本地加密，云端存储\n"
         "⚡️ **极速体验**: 自动分流，满速上传\n"
         "🎥 **流媒体**: 支持原画质在线播放",
-        "⚡️ **极速体验**: 自动分流，满速上传\n"
-        "🎥 **流媒体**: 支持原画质在线播放",
         reply_markup=get_main_menu_keyboard(is_adm)
     )
 
@@ -88,6 +86,9 @@ def get_main_menu_keyboard(is_admin_user=False):
 @Client.on_callback_query(filters.regex("agree_terms"))
 async def terms_btn_callback(client: Client, callback):
     from database import db
+    from handlers.session import activate_session
+
+    activate_session(callback.from_user.id)
     db.accept_terms(callback.from_user.id)
     
     await callback.answer("✅ 已同意条款")
