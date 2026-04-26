@@ -76,27 +76,37 @@ def _parse_tg_link(url: str):
     """
     解析 Telegram 消息链接，返回 (chat_id_or_username, message_id)
     支持：
-      https://t.me/c/1234567890/123   → (-1001234567890, 123)
-      https://t.me/channelname/123    → ("channelname", 123)
+      https://t.me/c/1234567890/123            → (-1001234567890, 123)
+      https://t.me/channelname/123             → ("channelname", 123)
+      https://t.me/channelname/123?single      → ("channelname", 123)
+      https://t.me/channelname/500?single&comment=664  → ("channelname", 500)
+    注意：带 comment= 的是评论区链接，取的是主消息 ID（500），不是评论 ID（664）
     """
+    import re
     url = url.strip()
-    if "t.me/c/" in url:
-        parts = url.split("t.me/c/")[1].split("/")
-        chat_id = int("-100" + parts[0])
-        message_id = int(parts[1].split("?")[0])
+
+    # 统一用正则解析，兼容所有参数格式
+    # 私有频道: t.me/c/数字ID/消息ID
+    m = re.search(r"t\.me/c/(\d+)/(\d+)", url)
+    if m:
+        chat_id = int("-100" + m.group(1))
+        message_id = int(m.group(2))
         return chat_id, message_id
-    elif "t.me/" in url:
-        parts = url.split("t.me/")[1].split("/")
-        if len(parts) >= 2:
-            chat_username = parts[0]
-            message_id = int(parts[1].split("?")[0])
-            return chat_username, message_id
+
+    # 公开频道/群组: t.me/用户名/消息ID
+    m = re.search(r"t\.me/([\w\d_]+)/(\d+)", url)
+    if m:
+        chat_username = m.group(1)
+        message_id = int(m.group(2))
+        return chat_username, message_id
+
     raise ValueError("无法识别的链接格式")
 
 
 # ========== 主处理器 ==========
 @Client.on_message(
-    filters.regex(r"https://t\.me/(c/|)(\d+|[\w\d_]+)/(\d+)") & filters.private,
+    # 兼容带参数的链接，如 ?single&comment=664
+    filters.regex(r"https://t\.me/(c/|)([\w\d_]+)/(\d+)") & filters.private,
     group=5  # 优先级低于管理员处理器（管理员处理器在 transfer.py group=0）
 )
 async def public_transfer_handler(client: Client, message: Message):
