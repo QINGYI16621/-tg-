@@ -79,8 +79,6 @@ async def main():
         # 2. 设置管理员的菜单 (精简版)
         admin_commands = public_commands + [
              BotCommand("download", "批量下载"),
-             BotCommand("recent", "最近对话"),
-             BotCommand("getid", "解析频道/消息ID"),
              BotCommand("tasks", "下载任务记录"),
              BotCommand("security", "安全状态"),
              BotCommand("stats", "统计信息"),

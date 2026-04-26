@@ -191,11 +191,9 @@ async def terms_middleware(client: Client, message: Message):
 
 
 # 全局存储
-user_dialogs_cache = {}
 user_download_dest = {}
 pending_download_jobs = {}
 cancel_download_users = set()
-media_locator_cache = {}
 user_last_action = {}  # 频率限制：记录用户上次操作时间
 user_collecting_mode = {}  # 收集模式：{user_id: {"collection_id": xxx, "collection_name": xxx, "files": []}}
 user_last_collection = {}  # 最后一次使用的合集 {user_id: {'id': id, 'name': name}}
@@ -373,8 +371,7 @@ async def security_cmd(client: Client, message: Message):
         f"管理员 ID: `{client.admin_id}`\n"
         f"用户数: `{len(users)}`\n"
         f"待确认下载: `{active_jobs}`\n"
-        f"媒体定位缓存: `{len(media_locator_cache)}`\n\n"
-        "✅ 批量下载、最近对话、媒体定位、用户号搜索等高风险功能仅管理员可见/可用。\n"
+        "✅ 批量下载功能仅管理员可见/可用。\n"
         "✅ 普通用户只能使用存储、提取码和自己的合集功能。\n"
         "⚠️ 如果机器人泄露，请第一时间去 BotFather 重置 Token，并停止服务器进程。"
     )
@@ -469,87 +466,9 @@ def check_rate_limit(user_id, limit_seconds=5):
     user_last_action[user_id] = now
     return True
 
-@Client.on_message(filters.command("recent") & filters.private)
-async def list_recent_chats(client: Client, message: Message):
-    """
-    List recent chats with pagination and category filter.
-    管理员专用命令
-    """
-    if not await require_admin(client, message):
-        return
-    
-    user = client.user_client
-    status_msg = await message.reply_text("🔄 正在获取对话列表（可能需要几秒钟）...")
-    
-    # 获取所有对话
-    dialogs_list = []
-    async for dialog in user.get_dialogs(limit=200):  # 增加扫描数量
-        chat = dialog.chat
-        
-        # 处理名称，特别处理 deleted 账号
-        if chat.first_name == "Deleted Account" or (hasattr(chat, 'is_deleted') and chat.is_deleted):
-            title = "🚫 Deleted Account"
-        else:
-            title = chat.title or chat.first_name or "Unknown"
-        
-        # 生成链接
-        if chat.username:
-            link = f"https://t.me/{chat.username}"
-        elif str(chat.type) in ["ChatType.CHANNEL", "ChatType.SUPERGROUP", "ChatType.GROUP"]:
-            link = f"https://t.me/c/{str(chat.id).replace('-100', '')}/1"
-        else:
-            link = None
-        
-        # 分类标签
-        chat_type = str(chat.type).replace("ChatType.", "")
-        if chat_type == "PRIVATE" and hasattr(chat, 'is_bot') and chat.is_bot:
-            chat_type = "BOT"
-        
-        dialogs_list.append({
-            "title": title, 
-            "id": chat.id, 
-            "type": chat_type,
-            "link": link
-        })
-    
-    if not dialogs_list:
-        await status_msg.edit_text("❌ 没有找到任何对话。")
-        return
-    
-    # 缓存结果
-    user_dialogs_cache[message.from_user.id] = dialogs_list
-    
-    # 显示第一页（默认全部）
-    await show_dialogs_page(status_msg, dialogs_list, page=0, filter_type="ALL")
-
-@Client.on_message(filters.command("search") & filters.private)
-async def search_chats(client: Client, message: Message):
-    """
-    Search chats by keyword.
-    Usage: /search <keyword>
-    """
-    from pyrogram.types import ForceReply
-    
-    if not await require_admin(client, message):
-        return
-
-    args = message.command or []
-    
-    if len(args) < 2:
-        await message.reply_text(
-            "🔍 **搜索对话**\n\n"
-            "请直接输入你要搜索的关键词：\n"
-            "（例如输入：福利）",
-            reply_markup=ForceReply(placeholder="输入关键词...")
-        )
-        return
-    
-    keyword = " ".join(args[1:]).lower()
-    await do_search(client, message, keyword)
-
 @Client.on_message(filters.reply & filters.private & filters.text)
 async def handle_reply_input(client: Client, message: Message):
-    """Handle reply to search/download/newcollection prompts."""
+    """Handle reply to download/newcollection prompts."""
     # 权限检查
     if message.from_user.id != client.admin_id:
         return
@@ -559,14 +478,8 @@ async def handle_reply_input(client: Client, message: Message):
     
     prompt_text = message.reply_to_message.text or ""
     
-    # 处理搜索回复
-    if "请直接输入你要搜索的关键词" in prompt_text:
-        keyword = message.text.strip()
-        if keyword:
-            await do_search(client, message, keyword.lower())
-    
     # 处理下载回复 (匹配新旧两种提示格式)
-    elif ("频道ID" in prompt_text and "数量" in prompt_text) or "请按格式输入" in prompt_text:
+    if ("频道ID" in prompt_text and "数量" in prompt_text) or "请按格式输入" in prompt_text:
         try:
             chat_id, start_message_id, limit = await _parse_download_source(client, message.text)
             dest = user_download_dest.get(message.from_user.id, "fast_collection")
@@ -583,339 +496,6 @@ async def handle_reply_input(client: Client, message: Message):
         collection_name = message.text.strip()
         if collection_name:
             await do_create_collection(client, message, collection_name)
-
-async def do_search(client, message, keyword):
-    """Perform the actual search."""
-    # Search is still ADMIN ONLY (uses user_client) - or switch to storage?
-    # User didn't ask to open search. But asked to manage users.
-    # Keep user_client for Admin Search.
-    user = client.user_client
-    status_msg = await message.reply_text(f"🔍 正在搜索包含 **{keyword}** 的对话...")
-    
-    results = []
-    count = 0
-    async for dialog in user.get_dialogs(limit=500):
-        chat = dialog.chat
-        title = chat.title or chat.first_name or "Unknown"
-        if keyword in title.lower():
-            count += 1
-            # 生成链接
-            if chat.username:
-                link = f"https://t.me/{chat.username}"
-            elif str(chat.type) in ["ChatType.CHANNEL", "ChatType.SUPERGROUP", "ChatType.GROUP"]:
-                link = f"https://t.me/c/{str(chat.id).replace('-100', '')}/1"
-            else:
-                link = None
-            
-            link_text = f"[🔗]({link})" if link else ""
-            chat_type = str(chat.type).replace("ChatType.", "")
-            results.append(f"{count}. **{title}** {link_text}\n🆔 `{chat.id}` | {chat_type}\n")
-    
-    if results:
-        output = f"🔎 **搜索结果** (找到 {len(results)} 个)\n\n"
-        output += "\n".join(results[:15])  # 最多显示15个
-        if len(results) > 15:
-            output += f"\n(还有 {len(results)-15} 个结果未显示)"
-        output += "\n\n👉 复制 ID 后发送：`/download ID 数量`"
-    else:
-        output = f"❌ 没有找到包含 **{keyword}** 的对话。"
-    await status_msg.edit_text(output)
-
-@Client.on_message(filters.command("deleted") & filters.private)
-async def find_deleted_accounts(client: Client, message: Message):
-    """Specifically scan for deleted/banned account chats. 管理员专用"""
-    if not await require_admin(client, message):
-        return
-    
-    user = client.user_client
-    status_msg = await message.reply_text("🔍 正在扫描所有对话，寻找 Deleted Account...")
-    
-    results = []
-    count = 0
-    async for dialog in user.get_dialogs(limit=500):  # 扫描更多
-        chat = dialog.chat
-        count += 1
-        
-        # 多种方式检测 deleted account
-        is_deleted = False
-        name = chat.first_name or chat.title or ""
-        
-        # 方式1: 名字就是 Deleted Account
-        if "Deleted Account" in name or "deleted" in name.lower():
-            is_deleted = True
-        
-        # 方式2: 检查 is_deleted 属性（如果存在）
-        if hasattr(chat, 'is_deleted') and chat.is_deleted:
-            is_deleted = True
-        
-        # 方式3: 私聊但没有 first_name 和 last_name
-        if str(chat.type) == "ChatType.PRIVATE" and not chat.first_name and not chat.username:
-            is_deleted = True
-            name = "[空名字-可能是deleted]"
-        
-        if is_deleted:
-            results.append({
-                "name": name or "[无名]",
-                "id": chat.id,
-                "type": str(chat.type)
-            })
-    
-    if results:
-        output = f"🔎 扫描了 {count} 个对话，找到 {len(results)} 个疑似 Deleted Account：\n\n"
-        for i, r in enumerate(results[:15], 1):
-            output += f"{i}. **{r['name']}**\n🆔 `{r['id']}` ← 点击复制\n\n"
-        output += "⚠️ 死号无法通过链接跳转，请直接复制 ID\n"
-        output += "👉 然后发送：`/download ID 数量`"
-        await status_msg.edit_text(output)
-    else:
-        output = f"❌ 扫描了 {count} 个对话，没有找到 Deleted Account。\n\n"
-        output += "可能的原因：\n"
-        output += "1. 你已经删除了那个对话\n"
-        output += "2. 那个账号还没被封（名字没变成 Deleted Account）\n"
-        output += "3. 你从未跟那个账号有过对话"
-        await status_msg.edit_text(output)
-
-async def show_dialogs_page(message, dialogs_list, page=0, filter_type="ALL"):
-    """Helper to show a specific page of dialogs with optional filtering."""
-    
-    # 根据类型过滤
-    if filter_type != "ALL":
-        filtered_list = [d for d in dialogs_list if d['type'] == filter_type]
-    else:
-        filtered_list = dialogs_list
-    
-    per_page = 8
-    total_pages = max(1, (len(filtered_list) + per_page - 1) // per_page)
-    start = page * per_page
-    end = start + per_page
-    page_items = filtered_list[start:end]
-    
-    # 统计各类型数量
-    type_counts = {}
-    for d in dialogs_list:
-        t = d['type']
-        type_counts[t] = type_counts.get(t, 0) + 1
-    
-    output = f"📋 **对话列表** (第 {page+1}/{total_pages} 页)\n"
-    output += f"🔍 筛选: **{filter_type}** | 共 {len(filtered_list)} 个\n\n"
-    
-    if not page_items:
-        output += "❌ 该分类下没有对话。"
-    else:
-        for i, item in enumerate(page_items, start=start+1):
-            link_text = f"[🔗]({item['link']})" if item.get('link') else ""
-            output += f"{i}. **{item['title']}** {link_text}\n"
-            output += f"🆔 `{item['id']}` | {item.get('type', '?')}\n\n"
-    
-    output += "👉 复制 ID：`/download ID 数量`"
-    
-    # 构建分类按钮
-    filter_buttons = [
-        InlineKeyboardButton("全部", callback_data=f"dlg_filter_ALL_{page}"),
-        InlineKeyboardButton(f"频道({type_counts.get('CHANNEL', 0)})", callback_data=f"dlg_filter_CHANNEL_{page}"),
-        InlineKeyboardButton(f"群组({type_counts.get('SUPERGROUP', 0) + type_counts.get('GROUP', 0)})", callback_data=f"dlg_filter_SUPERGROUP_{page}"),
-        InlineKeyboardButton(f"机器人({type_counts.get('BOT', 0)})", callback_data=f"dlg_filter_BOT_{page}"),
-        InlineKeyboardButton(f"私聊({type_counts.get('PRIVATE', 0)})", callback_data=f"dlg_filter_PRIVATE_{page}"),
-    ]
-    
-    # 翻页按钮
-    nav_buttons = []
-    if page > 0:
-        nav_buttons.append(InlineKeyboardButton("⬅️ 上一页", callback_data=f"dlg_page_{filter_type}_{page-1}"))
-    if page < total_pages - 1:
-        nav_buttons.append(InlineKeyboardButton("下一页 ➡️", callback_data=f"dlg_page_{filter_type}_{page+1}"))
-    
-    keyboard = InlineKeyboardMarkup([filter_buttons, nav_buttons] if nav_buttons else [filter_buttons])
-    
-    await message.edit_text(output, reply_markup=keyboard, disable_web_page_preview=True)
-
-@Client.on_callback_query(filters.regex(r"^dlg_(filter|page)_"))
-async def dialogs_callback(client: Client, callback: CallbackQuery):
-    """Handle pagination and filter button clicks."""
-    if not await require_admin(client, callback, alert=True):
-        return
-    dialogs_list = user_dialogs_cache.get(callback.from_user.id, [])
-    
-    if not dialogs_list:
-        await callback.answer("缓存已过期，请重新发送 /recent", show_alert=True)
-        return
-    
-    data = callback.data
-    if data.startswith("dlg_filter_"):
-        # Filter button: dlg_filter_TYPE_page
-        parts = data.replace("dlg_filter_", "").rsplit("_", 1)
-        filter_type = parts[0]
-        page = 0  # Reset to first page when changing filter
-    else:
-        # Page button: dlg_page_TYPE_page
-        parts = data.replace("dlg_page_", "").rsplit("_", 1)
-        filter_type = parts[0]
-        page = int(parts[1])
-    
-    await show_dialogs_page(callback.message, dialogs_list, page, filter_type)
-    await callback.answer()
-
-@Client.on_message(filters.command("getid") & filters.private)
-async def get_chat_id(client: Client, message: Message):
-    """Get chat ID from a forwarded message. 管理员专用"""
-    if not await require_admin(client, message):
-        return
-    if not await check_auth(client, message):
-        return
-    
-    # 1. 检查是否有参数 (链接/用户名)
-    if len(message.command) > 1:
-        text = message.command[1]
-        
-        # A. 私有频道链接 t.me/c/12345/678
-        import re
-        match_private = re.search(r"t\.me/c/(\d+)", text)
-        if match_private:
-            id_part = match_private.group(1)
-            full_id = int(f"-100{id_part}")
-            msg_match = re.search(r"t\.me/c/\d+/(\d+)", text)
-            message_id = int(msg_match.group(1)) if msg_match else None
-            message_line = f"💬 **消息 ID**: `{message_id}`\n" if message_id else ""
-            download_line = f"\n📥 **精准下载格式**: `{full_id} {message_id} 1`" if message_id else ""
-            await message.reply_text(
-                f"✅ **通过链接解析**\n\n"
-                f"🔗 **链接**: `{text}`\n"
-                f"🆔 **ID**: `{full_id}`\n"
-                f"{message_line}"
-                f"📌 **类型**: 私有频道/群组 (计算推断)"
-                f"{download_line}"
-            )
-            return
-
-        # B. 公开用户名/链接 t.me/username
-        username = None
-        message_id = None
-        if "t.me/" in text:
-            # t.me/username/123 -> username
-            parts = text.split("t.me/")
-            if len(parts) > 1:
-                sub = parts[1].split("/")[0]
-                if sub and not sub.startswith("c"):
-                    username = sub
-                    msg_match = re.search(r"t\.me/[^/\s]+/(\d+)", text)
-                    message_id = int(msg_match.group(1)) if msg_match else None
-        elif text.startswith("@"):
-            username = text[1:]
-        elif not text.startswith("-100"): # not an ID
-            username = text
-
-        if username:
-            try:
-                chat = await client.get_chat(username)
-                message_line = f"💬 **消息 ID**: `{message_id}`\n" if message_id else ""
-                download_line = f"\n📥 **精准下载格式**: `{chat.id} {message_id} 1`" if message_id else ""
-                await message.reply_text(
-                    f"✅ **成功获取！**\n\n"
-                    f"📂 **名称**: {chat.title}\n"
-                    f"🆔 **ID**: `{chat.id}`\n"
-                    f"{message_line}"
-                    f"🔗 **Username**: @{chat.username}\n"
-                    f"📌 **类型**: {chat.type}"
-                    f"{download_line}"
-                )
-                return
-            except Exception as e:
-                await message.reply_text(f"❌ 无法解析用户名: {e}")
-                return
-
-    # 2. 检查是否回复了消息
-    if message.reply_to_message:
-        target = message.reply_to_message
-        if target.forward_from_chat:
-            chat = target.forward_from_chat
-            await message.reply_text(
-                f"✅ **成功获取！**\n\n"
-                f"📂 **名称**: {chat.title}\n"
-                f"🆔 **ID**: `{chat.id}`\n"
-                f"📌 **类型**: {chat.type}"
-            )
-            return
-        elif target.sender_chat:
-            chat = target.sender_chat
-            await message.reply_text(
-                f"✅ **成功获取！**\n\n"
-                f"📂 **名称**: {chat.title}\n"
-                f"🆔 **ID**: `{chat.id}`\n"
-                f"📌 **类型**: {chat.type}"
-            )
-            return
-    
-    await message.reply_text(
-        "ℹ️ **使用方法**\n\n"
-        "1. **回复**一条转发消息发送 `/getid`\n"
-        "2. 发送 `/getid 消息链接` (支持 t.me/c/xxxxx/123)\n"
-        "3. 发送 `/getid @用户名`\n\n"
-        "💡 消息 ID 是消息链接最后一段数字。\n"
-        "例如 `https://t.me/c/1234567890/4567` 的消息 ID 是 `4567`。\n\n"
-        "💡 **如果连链接都没有？**\n"
-        "试试用 `/linked 频道ID` 查询关联群组。"
-    )
-
-@Client.on_message(filters.command("linked") & filters.private)
-async def get_linked_chat(client: Client, message: Message):
-    """Get linked discussion group. 管理员专用"""
-    if not await require_admin(client, message):
-        return
-    if not await check_auth(client, message):
-        return
-    
-    # Use Storage Client (Idle Account) for safety
-    user = client.storage_client
-    args = message.command
-    
-    if len(args) < 2:
-        await message.reply_text(
-            "ℹ️ **用法**: `/linked 频道ID`\n\n"
-            "例如：`/linked -1001234567890`\n\n"
-            "这会查询某个频道关联的评论区群组 ID。\n"
-            "你可以先用 `/recent` 找到主频道的 ID。"
-        )
-        return
-    
-    channel_id = 0
-    try:
-        channel_id = int(args[1])
-        status_msg = await message.reply_text("🔍 正在查询...")
-        
-        # 1. Try with Storage Client (Protect Privacy)
-        chat = None
-        try:
-            chat = await client.storage_client.get_chat(channel_id)
-        except Exception as e:
-            # 2. Fallback for Admin: Try with User Client
-            if message.from_user.id == client.admin_id:
-                try:
-                    chat = await client.user_client.get_chat(channel_id)
-                except:
-                    raise e # Re-raise original or new error
-            else:
-                raise e
-
-        if chat.linked_chat:
-            linked = chat.linked_chat
-            await status_msg.edit_text(
-                f"✅ **找到关联的评论区！**\n\n"
-                f"📺 **主频道**: {chat.title}\n"
-                f"🆔 主频道 ID: `{chat.id}`\n\n"
-                f"💬 **评论区群组**: {linked.title}\n"
-                f"🆔 评论区 ID: `{linked.id}`\n\n"
-                f"👉 复制评论区 ID，然后：`/download {linked.id} 10`\n"
-                f"💡 **提示**: 此操作无需加入群组，不会触发进群封禁。"
-            )
-        else:
-            await status_msg.edit_text(
-                f"⚠️ 频道 **{chat.title}** 没有关联评论区群组。\n\n"
-                f"可能是：\n"
-                f"1. 这个频道没开评论功能\n"
-                f"2. 评论区是受限的 (Bot 看不到)"
-            )
-    except Exception as e:
-        await message.reply_text(f"❌ 查询失败: {e}\n\n若是私密频道，请确保 '闲置账号' 在频道内。")
 
 @Client.on_message(filters.command("download") & filters.private)
 async def batch_download(client: Client, message: Message):
@@ -1194,14 +774,6 @@ async def request_download_confirmation(client, message, chat_id, limit, dest="c
     limit = int(limit)
     if limit <= 0:
         await message.reply_text("❌ 下载数量必须大于 0。")
-        return
-
-    max_count = getattr(config, "MAX_DOWNLOAD_COUNT", 50)
-    if limit > max_count:
-        await message.reply_text(
-            f"⚠️ 数量 `{limit}` 超过当前安全上限 `{max_count}`。\n\n"
-            f"请重新输入较小数量，或修改配置里的 `MAX_DOWNLOAD_COUNT`。"
-        )
         return
 
     mode_text = (
@@ -1760,187 +1332,6 @@ def _message_time_text(msg):
     if not getattr(msg, "date", None):
         return "未知时间"
     return msg.date.strftime("%m-%d %H:%M")
-
-async def show_recent_media_ids(client, message, chat_id, scan_limit=100, keyword=None):
-    """List recent media message IDs for chats where copying links/forwarding is unavailable."""
-    user = client.user_client
-    scan_limit = max(1, min(scan_limit, 500))
-    keyword = (keyword or "").strip()
-    keyword_lower = keyword.lower()
-    filter_text = f"\n🔍 关键词: `{keyword}`" if keyword else ""
-    status_msg = await message.reply_text(f"🔎 正在扫描 `{chat_id}` 最近 {scan_limit} 条消息...{filter_text}")
-
-    try:
-        await user.get_chat(chat_id)
-    except Exception:
-        pass
-
-    rows = []
-    scanned = 0
-    try:
-        async for msg in user.get_chat_history(chat_id, limit=scan_limit):
-            scanned += 1
-            media_info = _message_media_info(msg)
-            if not media_info:
-                continue
-            file_name, file_size, mime_type = media_info
-            content_preview = _message_content_preview(msg)
-            searchable = f"{file_name}\n{content_preview}\n{_message_sender_name(msg)}".lower()
-            if keyword_lower and keyword_lower not in searchable:
-                continue
-            if msg.video:
-                media_type = "视频"
-            elif msg.document:
-                media_type = "文件"
-            elif msg.photo:
-                media_type = "图片"
-            elif msg.audio:
-                media_type = "音频"
-            else:
-                media_type = "媒体"
-            rows.append((
-                msg.id,
-                media_type,
-                file_name,
-                file_size,
-                mime_type,
-                _message_sender_name(msg),
-                _message_time_text(msg),
-                content_preview,
-            ))
-    except Exception as e:
-        await status_msg.edit_text(
-            f"❌ 扫描失败: `{e}`\n\n"
-            "请确认 vault_user 账号已经加入该频道/群组，并且频道 ID 正确。"
-        )
-        return
-
-    if not rows:
-        await status_msg.edit_text(
-            f"❌ 最近 {scanned} 条消息里没有找到匹配的视频或文件。\n\n"
-            "可以把扫描数量调大，或去掉关键词。\n"
-            "例如：`-1001234567890 300`"
-        )
-        return
-
-    media_locator_cache[message.from_user.id] = {
-        "chat_id": chat_id,
-        "rows": rows,
-        "scanned": scanned,
-        "keyword": keyword,
-        "scan_limit": scan_limit,
-    }
-    await render_media_locator_page(status_msg, message.from_user.id, page=0)
-
-async def render_media_locator_page(message, user_id, page=0):
-    cache = media_locator_cache.get(user_id)
-    if not cache:
-        await message.edit_text("⚠️ 媒体定位缓存已过期，请重新使用“🎞 媒体定位”。")
-        return
-
-    rows = cache["rows"]
-    chat_id = cache["chat_id"]
-    scanned = cache["scanned"]
-    keyword = cache.get("keyword")
-    filter_text = f"\n🔍 关键词: `{keyword}`" if keyword else ""
-    per_page = 5
-    total_pages = max(1, (len(rows) + per_page - 1) // per_page)
-    page = max(0, min(page, total_pages - 1))
-    start = page * per_page
-    page_rows = rows[start:start + per_page]
-
-    text = (
-        f"🎞 **最近媒体定位**\n\n"
-        f"频道: `{chat_id}`\n"
-        f"已扫描: {scanned} 条 | 命中: {len(rows)} 个 | 第 {page + 1}/{total_pages} 页{filter_text}\n\n"
-    )
-    keyboard = []
-    for msg_id, media_type, file_name, file_size, mime_type, sender, time_text, content_preview in page_rows:
-        size_text = human_size(file_size)
-        text += (
-            f"• `{msg_id}` | {media_type} | {size_text} | {time_text}\n"
-            f"  发送: `{_short_text(sender, 30)}`\n"
-            f"  文件: `{_short_text(file_name, 42)}`\n"
-        )
-        if content_preview:
-            text += f"  内容: `{_short_text(content_preview, 70)}`\n"
-        keyboard.append([
-            InlineKeyboardButton(
-                f"⬇️ 下载 {msg_id}",
-                callback_data=f"dlmsg_{chat_id}_{msg_id}",
-            )
-        ])
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton("⬅️ 上一页", callback_data=f"medpg_{page - 1}"))
-    if page < total_pages - 1:
-        nav.append(InlineKeyboardButton("下一页 ➡️", callback_data=f"medpg_{page + 1}"))
-    if nav:
-        keyboard.append(nav)
-
-    text += (
-        "\n💡 消息 ID 就是左侧那串数字。\n"
-        "手动精准下载格式：`频道ID 消息ID 1`"
-    )
-    await message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-
-@Client.on_callback_query(filters.regex(r"^medpg_"))
-async def media_locator_page_callback(client, callback: CallbackQuery):
-    if not await require_admin(client, callback, alert=True):
-        return
-    try:
-        page = int(callback.data.split("_", 1)[1])
-    except Exception:
-        await callback.answer("页码无效", show_alert=True)
-        return
-    await render_media_locator_page(callback.message, callback.from_user.id, page)
-    await callback.answer()
-
-def human_size(size):
-    if not size:
-        return "未知大小"
-    units = ["B", "KB", "MB", "GB", "TB"]
-    value = float(size)
-    unit_index = 0
-    while value >= 1024 and unit_index < len(units) - 1:
-        value /= 1024
-        unit_index += 1
-    return f"{value:.1f}{units[unit_index]}"
-
-@Client.on_callback_query(filters.regex(r"^dlmsg_"))
-async def download_located_media_callback(client, callback: CallbackQuery):
-    if not await require_admin(client, callback, alert=True):
-        return
-    try:
-        _, chat_id_text, msg_id_text = callback.data.split("_", 2)
-        chat_id = int(chat_id_text)
-        msg_id = int(msg_id_text)
-    except Exception:
-        await callback.answer("按钮数据无效", show_alert=True)
-        return
-
-    await callback.answer("开始下载")
-
-    from types import SimpleNamespace
-
-    class MockMessage:
-        def __init__(self, bot_client, user_id):
-            self.chat = SimpleNamespace(id=user_id, type="private", title="User")
-            self.from_user = SimpleNamespace(id=user_id, is_bot=False, username="User", first_name="")
-            self._client = bot_client
-            self.text = f"{chat_id} {msg_id} 1"
-
-        async def reply_text(self, text, **kwargs):
-            return await self._client.send_message(self.chat.id, text, **kwargs)
-
-    dest = user_download_dest.get(callback.from_user.id, "fast_collection")
-    mock_msg = MockMessage(client, callback.from_user.id)
-    source_name = None
-    cache = media_locator_cache.get(callback.from_user.id)
-    if cache and cache.get("chat_id") == chat_id:
-        source_name = f"定位_{msg_id}"
-    await do_batch_download(client, mock_msg, chat_id, 1, dest, start_message_id=msg_id, source_name=source_name)
-
 
 # ========== 合集功能 ==========
 
@@ -3171,23 +2562,16 @@ async def menu_download_handler(client, message):
         )
         return
 
-    # Show sub-menu with old functions
+    # Only keep the download workflow. Dialog discovery helpers are intentionally removed.
     from pyrogram.types import ReplyKeyboardMarkup, KeyboardButton
     buttons = [
-        [KeyboardButton("📋 最近对话"), KeyboardButton("🔍 搜索对话")],
-        [KeyboardButton("🎞 媒体定位"), KeyboardButton("📥 开始下载")],
-        [KeyboardButton("📋 下载任务"), KeyboardButton("👻 删除账户")],
+        [KeyboardButton("📥 开始下载")],
         [KeyboardButton("❌ 取消操作"), KeyboardButton("🔙 返回主菜单")]
     ]
     await message.reply_text(
         "📥 **批量下载工具箱 (管理员)**\n\n"
-        "请选择操作：\n"
-        "🔹 **最近对话**: 查看用户账号的最近对话列表\n"
-        "🔹 **搜索对话**: 按关键词搜索对话\n"
-        "🔹 **媒体定位**: 无法复制链接时，扫描频道视频并显示消息ID\n"
-        "🔹 **下载任务**: 查看提取码、失败原因和续跑入口\n"
-        "🔹 **删除账户**: 查找已删除/封禁的账号\n"
-        "🔹 **开始下载**: 输入链接或ID批量下载\n",
+        "这里只保留下载功能，不再提供最近对话、搜索对话、删除账户、媒体定位、频道 ID 查询或关联群查询。\n\n"
+        "请自行提供消息链接，或输入：`频道ID 消息ID 数量` / `频道ID 数量`。",
         reply_markup=ReplyKeyboardMarkup(
             buttons,
             resize_keyboard=True,
@@ -3195,55 +2579,6 @@ async def menu_download_handler(client, message):
             is_persistent=True
         )
     )
-
-# Sub-handlers for batch download sub-menu
-@Client.on_message(filters.regex("📋 最近对话") & filters.private, group=-3)
-async def sub_recent_handler(client, message):
-    if not await require_admin(client, message):
-        return
-    await list_recent_chats(client, message)
-    message.stop_propagation()
-
-@Client.on_message(filters.regex("🔍 搜索对话") & filters.private, group=-3)
-async def sub_search_handler(client, message):
-    if not await require_admin(client, message):
-        return
-    await search_chats(client, message)
-    message.stop_propagation()
-
-@Client.on_message(filters.regex("👻 删除账户") & filters.private, group=-3)
-async def sub_deleted_handler(client, message):
-    if not await require_admin(client, message):
-        return
-    await find_deleted_accounts(client, message)
-    message.stop_propagation()
-
-@Client.on_message(filters.regex("📋 下载任务") & filters.private, group=-3)
-async def sub_download_tasks_handler(client, message):
-    if not await require_admin(client, message):
-        return
-    await download_tasks_cmd(client, message)
-    message.stop_propagation()
-
-@Client.on_message(filters.regex("🎞 媒体定位") & filters.private, group=-3)
-async def sub_media_locator_handler(client, message):
-    if not await require_admin(client, message):
-        return
-    from pyrogram.types import ForceReply
-    user_interaction_state[message.from_user.id] = "waiting_media_locator"
-    is_adm = message.from_user.id == client.admin_id
-    await message.reply_text(
-        "🎞 **媒体定位**\n\n"
-        "如果目标消息不能复制链接、不能转发，就用这个功能。\n\n"
-        "请输入：`频道ID 扫描数量`\n"
-        "例如：`-1001234567890 100`\n\n"
-        "也可以加关键词过滤：`频道ID 扫描数量 关键词`\n"
-        "例如：`-1001234567890 300 第12集`\n\n"
-        "我会用用户号扫描最近消息，列出 **消息 ID、发送人、时间、文件名、消息内容/说明**，并给出下载按钮。\n\n"
-        "发 `取消` 或点 **❌ 取消操作** 可退出。",
-        reply_markup=get_cancel_keyboard(is_adm)
-    )
-    message.stop_propagation()
 
 @Client.on_message(filters.regex("📥 开始下载") & filters.private, group=-3)
 async def sub_start_download_handler(client, message):
@@ -3404,32 +2739,6 @@ async def download_state_handler(client, message):
     uid = message.from_user.id
     state = user_interaction_state.get(uid)
 
-    if state == "waiting_media_locator":
-        if not await require_admin(client, message):
-            await clear_user_state(uid)
-            message.stop_propagation()
-            return
-        parts = message.text.strip().split()
-        try:
-            chat_id = int(parts[0])
-            scan_limit = int(parts[1]) if len(parts) > 1 else 100
-            keyword = " ".join(parts[2:]) if len(parts) > 2 else None
-        except Exception:
-            await message.reply_text(
-                "❌ 格式错误！请输入：`频道ID 扫描数量` 或 `频道ID 扫描数量 关键词`\n"
-                "例如：`-1001234567890 100`\n"
-                "例如：`-1001234567890 300 第12集`\n\n"
-                "也可以点 **❌ 取消操作** 或 **🔙 返回主菜单**。",
-                reply_markup=get_cancel_keyboard(message.from_user.id == client.admin_id)
-            )
-            message.stop_propagation()
-            return
-
-        del user_interaction_state[uid]
-        await show_recent_media_ids(client, message, chat_id, scan_limit, keyword=keyword)
-        message.stop_propagation()
-        return
-    
     # Handle original format: channel_id limit
     if state == "waiting_dl_id_limit":
         if not await require_admin(client, message):
@@ -3461,185 +2770,7 @@ async def download_state_handler(client, message):
         message.stop_propagation()
         return
     
-    # Handle link-based format (for backwards compatibility if ever needed)
-    if state != "waiting_dl_link":
-        message.continue_propagation()
-        return
-    if not await require_admin(client, message):
-        await clear_user_state(uid)
-        message.stop_propagation()
-        return
-    # Check if text exists
-    if not message.text:
-        await message.reply_text("⚠️ 请发送 **链接** (Link)，不要发送文件或图片。", quote=True)
-        message.stop_propagation()
-        return
-
-    del user_interaction_state[uid] # Consume state
-    
-    text = message.text.strip()
-    chat_id = None
-    chat_title = "未知"
-    
-    status_msg = await message.reply_text("🔍 正在解析链接...")
-    
-    import re
-    # 1. Private Link t.me/c/123/456
-    match_c = re.search(r"t\.me/c/(\d+)", text)
-    if match_c:
-        chat_id = int(f"-100{match_c.group(1)}")
-        chat_title = "私有频道/群组 (需闲置号在群内)"
-    
-    # 2. Public Username/Link
-    elif "t.me/" in text or text.startswith("@"):
-        # Extract username
-        username = text.split("t.me/")[-1].split("/")[0] if "t.me/" in text else text.replace("@", "")
-        # Remove + for invite links handled below
-        if not username.startswith("+") and not "joinchat" in text:
-             try:
-                 chat = await client.user_client.get_chat(username)
-                 chat_id = chat.id
-                 chat_title = chat.title
-             except Exception as e:
-                 await status_msg.edit_text(f"❌ 无法解析: {e}\n闲置号可能不在该群组，或者链接无效。")
-                 return
-
-    # 3. Invite Link
-    if not chat_id:
-        # Try Join
-        try:
-            # We use storage_client to join
-            chat = await client.user_client.join_chat(text)
-            chat_id = chat.id
-            chat_title = chat.title
-            await message.reply_text(f"✅ 已成功加入群组: {chat_title}")
-        except Exception as e:
-            # If already member (USER_ALREADY_PARTICIPANT)
-            if "USER_ALREADY_PARTICIPANT" in str(e):
-                 # Can't easily get ID from join_chat error, but we can try get_chat if we have a username/ID?
-                 # If invite link, we assume we joined. But we don't know ID if error.
-                 # Actually join_chat returns Chat object normally.
-                 # If error, we might be stuck.
-                 pass
-            
-            # If standard private link failed earlier, we are here.
-            await status_msg.edit_text(f"⚠️ 解析失败或无法加入: {e}\n如果这是私有群组且闲置号已在其中，请使用 `/getid` 获取 ID 后直接使用 /download ID。")
-            return
-
-    if chat_id:
-        # Check Linked Chat - REMOVED FOR SAFETY
-        # logic removed to prevent joining trap groups
-        
-        # Check Linked Chat (Safe Mode: Info Only)
-        linked_text = ""
-        try:
-             full_chat = await client.user_client.get_chat(chat_id)
-             if full_chat.linked_chat:
-                  lc = full_chat.linked_chat
-                  linked_text = (
-                      f"\n🔗 **关联群组 (评论区)**:\n"
-                      f"名: `{lc.title}`\n"
-                      f"ID: `{lc.id}`\n"
-                      f"(如需下载评论，请确保闲置号在群内，然后直接发送该ID或邀请链接)"
-                  )
-        except: pass
-
-        response_text = (
-            f"✅ **目标锁定**\n\n"
-            f"📂 名称: **{chat_title}**\n"
-            f"🆔 ID: `{chat_id}`"
-            f"{linked_text}\n\n"
-            f"请选择操作:"
-        )
-        
-        # Build Main Buttons
-        main_btns = [
-             InlineKeyboardButton("🚀 下载 (50)", callback_data=f"startdl_{chat_id}_50"),
-             InlineKeyboardButton("🚀 下载 (200)", callback_data=f"startdl_{chat_id}_200")
-        ]
-        leave_btns = [
-             InlineKeyboardButton("🚀 下载并退出 (50)", callback_data=f"startdl_{chat_id}_50_1"),
-             InlineKeyboardButton("🚀 下载并退出 (200)", callback_data=f"startdl_{chat_id}_200_1") 
-        ]
-        
-        keyboard = []
-        keyboard.append(main_btns)
-        keyboard.append(leave_btns)
-        keyboard.append([InlineKeyboardButton("🚪 闲置号退出群组", callback_data=f"leavedl_{chat_id}")])
-        
-        await status_msg.edit_text(response_text, reply_markup=InlineKeyboardMarkup(keyboard))
-
-
-@Client.on_callback_query(filters.regex(r"^startdl_"))
-async def start_download_btn(client, callback):
-    if not await require_admin(client, callback, alert=True):
-        return
-    parts = callback.data.split("_")
-    chat_id = int(parts[1])
-    count = int(parts[2])
-    auto_leave = False
-    if len(parts) > 3:
-        auto_leave = bool(int(parts[3]))
-    
-    leave_text = " (完成后自动退出)" if auto_leave else ""
-    await callback.message.edit_text(f"🚀 **开始下载任务**\n目标: `{chat_id}`\n数量: {count}{leave_text}\n\n请留意后续通知。")
-    
-    # Trigger batch download logic
-    # We can reuse do_batch_download logic but it expects a Message object with command args.
-    # Cleaner to refactor do_batch_download or call a shared function.
-    # For now, I will invoke a helper or copy logic.
-    # Reusing `handlers.tools.do_batch_download` is hard because of `message` arg.
-    # I'll create `execute_batch_download(client, user_id, target_chat_id, limit, status_message)`
-    
-    # ... Wait, I can't easily extract logic in this chunk.
-    # Quick Check: Can I construct a Fake Message?
-    # Yes, but hacky.
-    
-    # Better: Update do_batch_download to be split.
-    # BUT, for now, I will just call the command via client? No.
-    # I'll implement a simple loop here or call existing logic?
-    # `do_batch_download` is complex.
-    # I will Refactor `do_batch_download` separately?
-    # Or just spawn a task.
-    
-    await callback.answer("任务已提交")
-
-    from types import SimpleNamespace
-    
-    # Mock Message
-    class MockMessage:
-        def __init__(self, client, chat_id, text, user_id):
-            self.chat = SimpleNamespace(id=user_id, type="private", title="User")
-            self.from_user = SimpleNamespace(id=user_id, is_bot=False, username="User")
-            self.command = text.split()
-            self._client = client
-            self.text = text
-            
-        async def reply_text(self, text, **kwargs):
-            return await self._client.send_message(self.chat.id, text, **kwargs)
-            
-    mock_msg = MockMessage(client, chat_id, f"/download {chat_id} {count}", callback.from_user.id)
-    dest = user_download_dest.get(callback.from_user.id, "fast_collection")
-    await request_download_confirmation(client, mock_msg, chat_id, count, dest)
-    
-    if auto_leave:
-        try:
-            await client.storage_client.leave_chat(chat_id)
-            await client.send_message(callback.from_user.id, f"✅ 任务完成，闲置号已自动退出群组 `{chat_id}`")
-        except Exception as e:
-            await client.send_message(callback.from_user.id, f"⚠️ 自动退出失败: {e}")
-
-
-@Client.on_callback_query(filters.regex(r"^leavedl_"))
-async def leave_download_btn(client, callback):
-    if not await require_admin(client, callback, alert=True):
-        return
-    chat_id = int(callback.data.split("_")[1])
-    try:
-        await client.storage_client.leave_chat(chat_id)
-        await callback.message.edit_text(f"✅ 闲置号已退出群组 `{chat_id}`")
-    except Exception as e:
-        await callback.answer(f"退出失败: {e}", show_alert=True)
+    message.continue_propagation()
 
 # ========== User Management (Admin) ==========
 
@@ -3984,5 +3115,3 @@ async def cancel_cmd(client: Client, message: Message):
     )
     from handlers.setup import send_main_menu
     await send_main_menu(client, message)
-
-
