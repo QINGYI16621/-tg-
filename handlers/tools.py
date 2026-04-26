@@ -1324,13 +1324,17 @@ async def do_batch_download(client, message, chat_id, limit, dest="collection", 
         reason_text = "\n\n⚠️ **失败明细（前5条）**\n" + "\n".join(f"- {item}" for item in fail_reasons[:5])
 
     access_tip = ""
-    if dest in ("collection", "fast_collection") and default_collection:
+    if dest == "collection" and default_collection:
+        # 加密合集：需要密钥才能提取
         access_tip = (
             f"\n\n🔑 **提取码 / 合集密钥**\n"
             f"`{default_collection['access_key']}`\n"
             f"你之后直接把这个密钥发给机器人，就能提取本次下载归档。"
         )
-    elif dest in ("channel", "fast_collection") and success_keys:
+    elif dest == "fast_collection":
+        # 快速合集：文件已直接发给你，无需密钥
+        access_tip = f"\n\n✅ 文件已直接发送给你，无需提取码。"
+    elif dest == "channel" and success_keys:
         shown = "\n".join(
             f"- `{key}` | {_short_text(name, 24)}"
             for name, key in success_keys[:10]
@@ -1350,12 +1354,16 @@ async def do_batch_download(client, message, chat_id, limit, dest="collection", 
     )
     
     collection_tip = ""
-    if dest in ("collection", "fast_collection") and default_collection:
+    if dest == "collection" and default_collection:
+        # 加密合集：需要密钥提取
         collection_tip = (
             f"\n🔑 提取码 / 合集密钥: `{default_collection['access_key']}`\n"
             f"把这个密钥发给机器人即可提取。"
         )
-    elif dest in ("channel", "fast_collection") and success_keys:
+    elif dest == "fast_collection":
+        # 快速合集：文件已直接发给你，无需密钥
+        collection_tip = f"\n✅ 文件已直接发送给你，无需提取码。"
+    elif dest == "channel" and success_keys:
         first_name, first_key = success_keys[0]
         collection_tip = f"\n🔑 首个文件提取码: `{first_key}`"
 
