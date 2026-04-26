@@ -2688,6 +2688,9 @@ async def sub_start_download_handler(client, message):
 
 @Client.on_message(filters.regex("☁️ 存储/上传") & filters.private, group=-3)
 async def menu_storage_handler(client, message):
+    # 仅管理员可用
+    if message.from_user.id != client.admin_id:
+        return
     from pyrogram.types import ReplyKeyboardMarkup, KeyboardButton
     buttons = [
         [KeyboardButton("📂 我的合集"), KeyboardButton("🆕 新建合集")],

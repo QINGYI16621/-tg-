@@ -59,7 +59,7 @@ async def send_main_menu(client, message):
             "支持格式：\n"
             "• `https://t.me/频道名/消息ID`\n"
             "• `https://t.me/c/频道ID/消息ID`\n\n"
-            "☁️ 也可以上传文件到机器人进行加密存储。"
+            "发送链接即可开始下载 ⬇️"
         )
 
     await message.reply_text(
@@ -78,7 +78,6 @@ def get_main_menu_keyboard(is_admin_user=False):
         ]
     else:
         buttons = [
-            [KeyboardButton("☁️ 存储/上传")],
             [KeyboardButton("❌ 取消操作")],
         ]
 
@@ -116,7 +115,7 @@ async def terms_btn_callback(client: Client, callback):
             "支持格式：\n"
             "• `https://t.me/频道名/消息ID`\n"
             "• `https://t.me/c/频道ID/消息ID`\n\n"
-            "💡 也可以直接发送文件给我，我会自动加密存储。"
+            "发送链接即可开始下载 ⬇️"
         )
 
     await client.send_message(
