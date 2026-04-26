@@ -81,6 +81,8 @@ async def main():
              BotCommand("download", "批量下载"),
              BotCommand("recent", "最近对话"),
              BotCommand("getid", "解析频道/消息ID"),
+             BotCommand("tasks", "下载任务记录"),
+             BotCommand("security", "安全状态"),
              BotCommand("stats", "统计信息"),
         ]
         await bot.set_bot_commands(admin_commands, scope=BotCommandScopeChat(chat_id=ADMIN_ID))

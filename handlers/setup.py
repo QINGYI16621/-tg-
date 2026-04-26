@@ -162,7 +162,7 @@ async def channel_id_sniffer(client: Client, message: Message):
             "3. 把链接发给我。"
         )
 
-@Client.on_message(filters.text & filters.private & ~filters.reply & ~filters.command("start") & ~filters.command("recent") & ~filters.command("download") & ~filters.command("search") & ~filters.command("getid") & ~filters.command("linked") & ~filters.command("deleted") & ~filters.command("newcollection") & ~filters.command("addto") & ~filters.command("mycollections"))
+@Client.on_message(filters.text & filters.private & ~filters.reply & ~filters.command("start") & ~filters.command("recent") & ~filters.command("download") & ~filters.command("search") & ~filters.command("getid") & ~filters.command("linked") & ~filters.command("deleted") & ~filters.command("newcollection") & ~filters.command("addto") & ~filters.command("mycollections") & ~filters.command("tasks") & ~filters.command("security"))
 async def link_handler(client: Client, message: Message):
     """Handle links and collection keys"""
     # 权限检查

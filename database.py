@@ -126,6 +126,29 @@ class Database:
                 )
                 """
             )
+            self.cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS download_tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_key TEXT NOT NULL UNIQUE,
+                    owner_id INTEGER NOT NULL,
+                    source_chat_id INTEGER NOT NULL,
+                    source_title TEXT,
+                    start_message_id INTEGER,
+                    limit_count INTEGER DEFAULT 0,
+                    dest TEXT DEFAULT 'collection',
+                    collection_id INTEGER,
+                    collection_key TEXT,
+                    status TEXT DEFAULT 'pending',
+                    success_count INTEGER DEFAULT 0,
+                    fail_count INTEGER DEFAULT 0,
+                    last_message_id INTEGER,
+                    error_summary TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
 
             for column_name, column_type in [
                 ("local_path", "TEXT"),
@@ -151,6 +174,8 @@ class Database:
             self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_files_file_id ON files(file_id)")
             self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_collections_owner ON collections(owner_id)")
             self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_collection_files_collection ON collection_files(collection_id)")
+            self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_download_tasks_owner ON download_tasks(owner_id, created_at)")
+            self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_download_tasks_key ON download_tasks(task_key)")
 
     def add_file(
         self,
@@ -473,6 +498,124 @@ class Database:
                 """,
                 (user_id, 1 if accepted else 0),
             )
+
+    def _download_task_from_row(self, row):
+        if not row:
+            return None
+        return {
+            "id": row[0],
+            "task_key": row[1],
+            "owner_id": row[2],
+            "source_chat_id": row[3],
+            "source_title": row[4],
+            "start_message_id": row[5],
+            "limit_count": row[6],
+            "dest": row[7],
+            "collection_id": row[8],
+            "collection_key": row[9],
+            "status": row[10],
+            "success_count": row[11],
+            "fail_count": row[12],
+            "last_message_id": row[13],
+            "error_summary": row[14],
+            "created_at": row[15],
+            "updated_at": row[16],
+        }
+
+    def create_download_task(
+        self,
+        task_key,
+        owner_id,
+        source_chat_id,
+        source_title,
+        start_message_id,
+        limit_count,
+        dest,
+        collection_id=None,
+        collection_key=None,
+        status="pending",
+    ):
+        with self._transaction():
+            self.cursor.execute(
+                """
+                INSERT INTO download_tasks (
+                    task_key, owner_id, source_chat_id, source_title,
+                    start_message_id, limit_count, dest, collection_id,
+                    collection_key, status
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_key,
+                    owner_id,
+                    source_chat_id,
+                    source_title,
+                    start_message_id,
+                    limit_count,
+                    dest,
+                    collection_id,
+                    collection_key,
+                    status,
+                ),
+            )
+            return self.cursor.lastrowid
+
+    def update_download_task(self, task_key, **fields):
+        allowed = {
+            "status",
+            "success_count",
+            "fail_count",
+            "last_message_id",
+            "error_summary",
+            "collection_id",
+            "collection_key",
+        }
+        updates = [(key, value) for key, value in fields.items() if key in allowed]
+        if not updates:
+            return False
+        set_clause = ", ".join(f"{key} = ?" for key, _ in updates)
+        values = [value for _, value in updates]
+        values.append(task_key)
+        with self._transaction():
+            self.cursor.execute(
+                f"""
+                UPDATE download_tasks
+                SET {set_clause}, updated_at = CURRENT_TIMESTAMP
+                WHERE task_key = ?
+                """,
+                values,
+            )
+            return self.cursor.rowcount > 0
+
+    def get_download_task_by_key(self, task_key):
+        self.cursor.execute(
+            """
+            SELECT id, task_key, owner_id, source_chat_id, source_title,
+                   start_message_id, limit_count, dest, collection_id,
+                   collection_key, status, success_count, fail_count,
+                   last_message_id, error_summary, created_at, updated_at
+            FROM download_tasks
+            WHERE task_key = ?
+            """,
+            (task_key,),
+        )
+        return self._download_task_from_row(self.cursor.fetchone())
+
+    def get_user_download_tasks(self, owner_id, limit=10):
+        self.cursor.execute(
+            """
+            SELECT id, task_key, owner_id, source_chat_id, source_title,
+                   start_message_id, limit_count, dest, collection_id,
+                   collection_key, status, success_count, fail_count,
+                   last_message_id, error_summary, created_at, updated_at
+            FROM download_tasks
+            WHERE owner_id = ?
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (owner_id, limit),
+        )
+        return [self._download_task_from_row(row) for row in self.cursor.fetchall()]
 
 
 db = Database()
