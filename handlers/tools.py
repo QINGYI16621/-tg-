@@ -569,7 +569,7 @@ async def handle_reply_input(client: Client, message: Message):
     elif ("频道ID" in prompt_text and "数量" in prompt_text) or "请按格式输入" in prompt_text:
         try:
             chat_id, start_message_id, limit = await _parse_download_source(client, message.text)
-            dest = user_download_dest.get(message.from_user.id, "collection")
+            dest = user_download_dest.get(message.from_user.id, "fast_collection")
             await request_download_confirmation(client, message, chat_id, limit, dest, start_message_id=start_message_id)
         except Exception:
             await message.reply_text(
@@ -938,7 +938,8 @@ async def batch_download(client: Client, message: Message):
                 "📥 **批量下载**\n\n"
                 "**第一步：选择下载目的地**",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📂 我的下载（默认）", callback_data="dl_dest_collection")],
+                    [InlineKeyboardButton("⚡ 快速合集（推荐视频）", callback_data="dl_dest_fast_collection")],
+                    [InlineKeyboardButton("🔐 加密合集（私密文件）", callback_data="dl_dest_collection")],
                     [InlineKeyboardButton("📁 仅存储频道", callback_data="dl_dest_channel")],
                     [InlineKeyboardButton("⭐ 收藏夹 (Saved Messages)", callback_data="dl_dest_saved")]
                 ])
@@ -953,14 +954,14 @@ async def batch_download(client: Client, message: Message):
         else:
             limit = int(args[2])
         
-        # 默认归入“我的下载”合集；存储频道只作为底层加密仓库。
-        dest = user_download_dest.get(message.from_user.id, "collection")
+        # 默认走快速合集；私密文件可以在菜单里改为加密合集。
+        dest = user_download_dest.get(message.from_user.id, "fast_collection")
         await request_download_confirmation(client, message, chat_id, limit, dest, start_message_id=start_message_id)
         
     except Exception as e:
         await message.reply_text(f"❌ 发生严重错误: {e}")
 
-@Client.on_callback_query(filters.regex(r"^dl_dest_(collection|channel|saved)$"))
+@Client.on_callback_query(filters.regex(r"^dl_dest_(fast_collection|collection|channel|saved)$"))
 async def download_dest_callback(client: Client, callback: CallbackQuery):
     """Handle destination selection."""
     if not await require_admin(client, callback, alert=True):
@@ -969,16 +970,19 @@ async def download_dest_callback(client: Client, callback: CallbackQuery):
     user_download_dest[callback.from_user.id] = dest
     
     dest_names = {
-        "collection": "📂 我的下载",
+        "fast_collection": "⚡ 快速合集",
+        "collection": "🔐 加密合集",
         "channel": "📁 仅存储频道",
         "saved": "⭐ 收藏夹",
     }
-    dest_name = dest_names.get(dest, "📂 我的下载")
+    dest_name = dest_names.get(dest, "⚡ 快速合集")
     
     from pyrogram.types import ForceReply
     await callback.message.edit_text(
         f"📥 **批量下载**\n\n"
         f"✅ 已选择目的地：{dest_name}\n\n"
+        f"⚡ 快速合集不会下载/加密，速度快；若源消息受保护导致复制失败，会在任务里标记失败。\n"
+        f"🔐 加密合集会下载、加密、上传，更安全但更慢。\n\n"
         f"**第二步：输入来源**\n"
         f"最简单：复制目标视频的消息链接直接发给我。\n"
         f"消息 ID 就是链接最后一段数字。\n\n"
@@ -1178,6 +1182,7 @@ async def _parse_download_source(client, text):
 def _download_dest_name(dest):
     return {
         "collection": f"📂 合集：{DEFAULT_DOWNLOAD_COLLECTION_NAME}",
+        "fast_collection": "⚡ 快速合集",
         "channel": "📁 仅存储频道",
         "saved": "⭐ 收藏夹",
     }.get(dest, f"📂 合集：{DEFAULT_DOWNLOAD_COLLECTION_NAME}")
@@ -1288,6 +1293,15 @@ async def do_batch_download(client, message, chat_id, limit, dest="collection", 
         target_chat_id = config.STORAGE_CHANNEL_ID
         dest_name = f"📂 合集：{default_collection['name']}"
         send_client = client
+    elif dest == "fast_collection":
+        default_collection = create_download_task_collection(message.from_user.id, source_name)
+        if not default_collection:
+            await message.reply_text("❌ 无法创建本次快速合集，请稍后重试。")
+            return
+
+        target_chat_id = config.STORAGE_CHANNEL_ID
+        dest_name = f"⚡ 快速合集：{default_collection['name']}"
+        send_client = user
     else:
         target_chat_id = config.STORAGE_CHANNEL_ID
         dest_name = _download_dest_name(dest)
@@ -1446,6 +1460,81 @@ async def do_batch_download(client, message, chat_id, limit, dest="collection", 
                 )
             except: pass
 
+            if dest == "fast_collection":
+                try:
+                    copied_msg = await user.copy_message(
+                        chat_id=target_chat_id,
+                        from_chat_id=chat_id,
+                        message_id=target_msg.id,
+                    )
+                except Exception as e:
+                    fail_count += 1
+                    hint = _download_error_hint(e)
+                    fail_reasons.append(f"#{target_msg.id}: 快速复制失败：{hint}")
+                    db.update_download_task(
+                        task_key,
+                        success_count=success_count,
+                        fail_count=fail_count,
+                        last_message_id=getattr(target_msg, "id", None),
+                        error_summary="\n".join(fail_reasons[-3:]),
+                    )
+                    continue
+
+                copied_media = _message_media_info(copied_msg)
+                if not copied_media:
+                    fail_count += 1
+                    fail_reasons.append(f"#{target_msg.id}: 快速复制后未返回媒体")
+                    continue
+
+                copied_file_name, copied_file_size, copied_mime_type = copied_media
+                copied_file_id = None
+                copied_unique_id = None
+                if copied_msg.video:
+                    copied_file_id = copied_msg.video.file_id
+                    copied_unique_id = copied_msg.video.file_unique_id
+                elif copied_msg.document:
+                    copied_file_id = copied_msg.document.file_id
+                    copied_unique_id = copied_msg.document.file_unique_id
+                elif copied_msg.photo:
+                    copied_file_id = copied_msg.photo.file_id
+                    copied_unique_id = copied_msg.photo.file_unique_id
+                elif copied_msg.audio:
+                    copied_file_id = copied_msg.audio.file_id
+                    copied_unique_id = copied_msg.audio.file_unique_id
+
+                if not copied_file_id or not copied_unique_id:
+                    fail_count += 1
+                    fail_reasons.append(f"#{target_msg.id}: 快速复制后缺少 file_id")
+                    continue
+
+                key_length = secrets.randbelow(17) + 16
+                access_key = ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(key_length))
+                new_file_id = db.add_file(
+                    message_id=copied_msg.id,
+                    chat_id=target_chat_id,
+                    file_id=copied_file_id,
+                    file_unique_id=copied_unique_id,
+                    file_name=copied_file_name or file_name,
+                    caption=_message_content_preview(target_msg),
+                    file_size=copied_file_size or file_size,
+                    mime_type=copied_mime_type or mime_type,
+                    storage_mode='telegram_fast',
+                    access_key=access_key,
+                    is_encrypted=False,
+                    encryption_key=None,
+                )
+                db.add_file_to_collection(default_collection["id"], new_file_id)
+                success_keys.append((copied_file_name or file_name, access_key))
+                success_count += 1
+                db.update_download_task(
+                    task_key,
+                    status="running",
+                    success_count=success_count,
+                    fail_count=fail_count,
+                    last_message_id=getattr(target_msg, "id", None),
+                )
+                continue
+
             # 1. Download
             temp_dir = config.TEMP_DOWNLOAD_DIR
             if not os.path.exists(temp_dir):
@@ -1453,9 +1542,14 @@ async def do_batch_download(client, message, chat_id, limit, dest="collection", 
                 
             dl_path = await user.download_media(target_msg, file_name=os.path.join(temp_dir, file_name))
             
-            if not dl_path:
+            if not dl_path or not os.path.exists(dl_path) or os.path.getsize(dl_path) < 1024:
                 fail_count += 1
-                fail_reasons.append(f"#{target_msg.id}: 下载返回空路径")
+                actual_size = os.path.getsize(dl_path) if dl_path and os.path.exists(dl_path) else 0
+                fail_reasons.append(f"#{target_msg.id}: 下载得到异常小文件 ({actual_size}B)，疑似 API 受限/下载中断")
+                try:
+                    if dl_path and os.path.exists(dl_path):
+                        os.remove(dl_path)
+                except: pass
                 db.update_download_task(
                     task_key,
                     success_count=success_count,
@@ -1583,13 +1677,13 @@ async def do_batch_download(client, message, chat_id, limit, dest="collection", 
         reason_text = "\n\n⚠️ **失败明细（前5条）**\n" + "\n".join(f"- {item}" for item in fail_reasons[:5])
 
     access_tip = ""
-    if dest == "collection" and default_collection:
+    if dest in ("collection", "fast_collection") and default_collection:
         access_tip = (
             f"\n\n🔑 **提取码 / 合集密钥**\n"
             f"`{default_collection['access_key']}`\n"
             f"你之后直接把这个密钥发给机器人，就能提取本次下载归档。"
         )
-    elif dest == "channel" and success_keys:
+    elif dest in ("channel", "fast_collection") and success_keys:
         shown = "\n".join(
             f"- `{key}` | {_short_text(name, 24)}"
             for name, key in success_keys[:10]
@@ -1609,12 +1703,12 @@ async def do_batch_download(client, message, chat_id, limit, dest="collection", 
     )
     
     collection_tip = ""
-    if dest == "collection" and default_collection:
+    if dest in ("collection", "fast_collection") and default_collection:
         collection_tip = (
             f"\n🔑 提取码 / 合集密钥: `{default_collection['access_key']}`\n"
             f"把这个密钥发给机器人即可提取。"
         )
-    elif dest == "channel" and success_keys:
+    elif dest in ("channel", "fast_collection") and success_keys:
         first_name, first_key = success_keys[0]
         collection_tip = f"\n🔑 首个文件提取码: `{first_key}`"
 
@@ -1839,7 +1933,7 @@ async def download_located_media_callback(client, callback: CallbackQuery):
         async def reply_text(self, text, **kwargs):
             return await self._client.send_message(self.chat.id, text, **kwargs)
 
-    dest = user_download_dest.get(callback.from_user.id, "collection")
+    dest = user_download_dest.get(callback.from_user.id, "fast_collection")
     mock_msg = MockMessage(client, callback.from_user.id)
     source_name = None
     cache = media_locator_cache.get(callback.from_user.id)
@@ -2056,9 +2150,11 @@ async def send_collection_files(client: Client, message: Message, files: list, c
         status_msg = edit_msg
         await status_msg.edit_text(f"📁 **{collection_name}**\n准备发送 {len(files)} 个文件...")
     else:
+        has_encrypted_files = any(f.get('is_encrypted') for f in files)
+        prepare_text = "正在准备下载与解密..." if has_encrypted_files else "正在快速发送..."
         status_msg = await message.reply_text(
             f"📁 **{collection_name}**\n"
-            f"共 {len(files)} 个文件，正在准备下载与解密..."
+            f"共 {len(files)} 个文件，{prepare_text}"
         )
     
     from pyrogram.types import InputMediaPhoto, InputMediaVideo
@@ -2140,10 +2236,29 @@ async def send_collection_files(client: Client, message: Message, files: list, c
                 except: continue
                     
             else:
-                msg = await storage_client.get_messages(f["chat_id"], f["message_id"])
-                dl_path = await storage_client.download_media(msg, file_name=os.path.join(temp_dir, f"plain_{f['id']}"))
-                local_path = dl_path
-                batch_temp_paths.append(local_path)
+                await send_and_cleanup_batch()
+                try:
+                    await client.copy_message(
+                        chat_id=message.chat.id,
+                        from_chat_id=f["chat_id"],
+                        message_id=f["message_id"],
+                    )
+                    sent_count += 1
+                    continue
+                except Exception:
+                    try:
+                        await client.send_cached_media(
+                            message.chat.id,
+                            f["file_id"],
+                            caption=f.get("caption") or "",
+                        )
+                        sent_count += 1
+                        continue
+                    except Exception:
+                        msg = await storage_client.get_messages(f["chat_id"], f["message_id"])
+                        dl_path = await storage_client.download_media(msg, file_name=os.path.join(temp_dir, f"plain_{f['id']}"))
+                        local_path = dl_path
+                        batch_temp_paths.append(local_path)
             
             if not local_path or not os.path.exists(local_path):
                 continue
@@ -3145,6 +3260,8 @@ async def sub_start_download_handler(client, message):
         "频道 ID：`-1001234567890`\n"
         "消息 ID：`4567`\n\n"
         "支持两种格式：\n\n"
+        "默认使用 ⚡ 快速合集：不下载、不解密，速度快。\n"
+        "如果源消息禁止复制，任务会标记失败，可再改用加密合集尝试。\n\n"
         "1. 扫描最近媒体：`频道ID 数量`\n"
         "   例如：`-1001234567890 50`\n\n"
         "2. 精准下载消息：`频道ID 消息ID 数量`\n"
@@ -3338,8 +3455,8 @@ async def download_state_handler(client, message):
         # Success! Consume state now
         del user_interaction_state[uid]
         
-        # Use default destination (collection)
-        dest = user_download_dest.get(uid, "collection")
+        # Use default destination (fast collection)
+        dest = user_download_dest.get(uid, "fast_collection")
         await request_download_confirmation(client, message, chat_id, limit, dest, start_message_id=start_message_id)
         message.stop_propagation()
         return
@@ -3502,7 +3619,7 @@ async def start_download_btn(client, callback):
             return await self._client.send_message(self.chat.id, text, **kwargs)
             
     mock_msg = MockMessage(client, chat_id, f"/download {chat_id} {count}", callback.from_user.id)
-    dest = user_download_dest.get(callback.from_user.id, "collection")
+    dest = user_download_dest.get(callback.from_user.id, "fast_collection")
     await request_download_confirmation(client, mock_msg, chat_id, count, dest)
     
     if auto_leave:
