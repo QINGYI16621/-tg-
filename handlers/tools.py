@@ -488,7 +488,7 @@ async def handle_reply_input(client: Client, message: Message):
             await message.reply_text(
                 "❌ 格式错误！\n\n"
                 "可以直接发消息链接，例如：`https://t.me/c/1234567890/4567`\n"
-                "或输入：`频道ID 数量` / `频道ID 消息ID 数量`"
+                "或输入：`频道ID 消息ID 数量`（精准模式）"
             )
     
     # 处理创建合集回复
@@ -568,10 +568,9 @@ async def download_dest_callback(client: Client, callback: CallbackQuery):
         f"消息 ID 就是链接最后一段数字。\n\n"
         f"消息链接：`https://t.me/c/1234567890/4567`\n"
         f"其中频道 ID 为 `-1001234567890`，消息 ID 为 `4567`\n\n"
-        f"扫描最近媒体：`频道ID 数量`\n"
-        f"精准下载某条消息：`频道ID 消息ID 数量`\n\n"
-        f"例如：`-1001234567890 10`\n"
-        f"例如：`-1001234567890 4567 1`\n\n"
+        f"精准下载：`频道ID 消息ID 数量`\n\n"
+        f"例如：`-1001234567890 4567 1`（下载消息4567起共1条）\n"
+        f"例如：`-1001234567890 4567 5`（下载消息4567起共5条）\n\n"
         f"发 `取消` 或点 **❌ 取消操作** 可退出。"
     )
     await client.send_message(
@@ -918,7 +917,40 @@ async def do_batch_download(client, message, chat_id, limit, dest="collection", 
             # 精准模式：从指定消息 ID 往前取 N 条消息，适合已知视频消息 ID 的场景。
             first_id = max(1, start_message_id - limit + 1)
             message_ids = list(range(start_message_id, first_id - 1, -1))
-            fetched = await user.get_messages(chat_id, message_ids)
+            try:
+                fetched = await user.get_messages(chat_id, message_ids)
+            except Exception as e_get:
+                # 直接获取失败，尝试通过讨论区 API 兜底（适用于评论区绑定群组但不允许加入的情况）
+                err_str = str(e_get)
+                if any(k in err_str for k in ("CHANNEL_PRIVATE", "USER_NOT_PARTICIPANT", "PEER_ID_INVALID", "CHAT_FORBIDDEN")):
+                    await status_msg.edit_text("⚠️ 直接访问失败，尝试通过讨论区 API 获取...")
+                    try:
+                        from pyrogram import raw
+                        peer = await user.resolve_peer(chat_id)
+                        # 用第一个消息 ID 尝试获取讨论群信息
+                        disc_result = await user.invoke(
+                            raw.functions.messages.GetDiscussionMessage(
+                                peer=peer,
+                                msg_id=start_message_id
+                            )
+                        )
+                        if disc_result and disc_result.chats:
+                            discussion_chat = disc_result.chats[0]
+                            disc_chat_id = int("-100" + str(discussion_chat.id))
+                            # 重新构造讨论群的消息 ID 列表
+                            # GetDiscussionMessage 返回的消息在讨论群中的 ID
+                            disc_msg_id = disc_result.messages[0].id if disc_result.messages else start_message_id
+                            disc_first_id = max(1, disc_msg_id - limit + 1)
+                            disc_message_ids = list(range(disc_msg_id, disc_first_id - 1, -1))
+                            fetched = await user.get_messages(disc_chat_id, disc_message_ids)
+                            # 更新 chat_id 为讨论群 ID，后续下载用
+                            chat_id = disc_chat_id
+                        else:
+                            raise Exception("讨论区 API 未返回群组信息")
+                    except Exception as e_disc:
+                        raise Exception(f"直接访问失败: {err_str} | 讨论区兜底也失败: {e_disc}")
+                else:
+                    raise e_get
             if not isinstance(fetched, list):
                 fetched = [fetched]
             scan_count = len(fetched)
@@ -930,16 +962,30 @@ async def do_batch_download(client, message, chat_id, limit, dest="collection", 
             # Scan up to 500 messages or 10x the limit to find media
             max_scan = max(500, limit * 10)
 
-            async for msg in user.get_chat_history(chat_id):
-                scan_count += 1
-                if msg.media:
-                    messages_to_process.append(msg)
+            try:
+                async for msg in user.get_chat_history(chat_id):
+                    scan_count += 1
+                    if msg.media:
+                        messages_to_process.append(msg)
 
-                if len(messages_to_process) >= limit:
-                    break
+                    if len(messages_to_process) >= limit:
+                        break
 
-                if scan_count >= max_scan:
-                    break
+                    if scan_count >= max_scan:
+                        break
+            except Exception as e_hist:
+                # get_chat_history 失败（非成员），扫描模式无法通过讨论区 API 兜底
+                # 提示用户改用精准模式（需要指定消息 ID）
+                err_str = str(e_hist)
+                if any(k in err_str for k in ("CHANNEL_PRIVATE", "USER_NOT_PARTICIPANT", "PEER_ID_INVALID", "CHAT_FORBIDDEN")):
+                    raise Exception(
+                        f"{err_str}\n\n"
+                        f"💡 提示：该群组不允许加入，无法扫描历史消息。\n"
+                        f"请改用精准模式：`频道ID 消息ID 数量`\n"
+                        f"例如：`-1001234567890 4567 5`"
+                    )
+                else:
+                    raise e_hist
                 
     except Exception as e:
         error_msg = str(e)
@@ -1033,16 +1079,120 @@ async def do_batch_download(client, message, chat_id, limit, dest="collection", 
             except: pass
 
             if dest == "fast_collection":
+                # 先尝试快速复制（copy_message），失败则降级为下载→上传
+                copied_msg = None
+                fast_copy_failed = False
                 try:
                     copied_msg = await user.copy_message(
                         chat_id=target_chat_id,
                         from_chat_id=chat_id,
                         message_id=target_msg.id,
                     )
-                except Exception as e:
+                except Exception as copy_err:
+                    # 受保护内容/禁止转发 -> 降级为下载→上传
+                    fast_copy_failed = True
+                    copy_hint = _download_error_hint(copy_err)
+
+                if copied_msg is not None:
+                    # 快速复制成功
+                    copied_media = _message_media_info(copied_msg)
+                    if not copied_media:
+                        fail_count += 1
+                        fail_reasons.append(f"#{target_msg.id}: 快速复制后未返回媒体")
+                        db.update_download_task(
+                            task_key,
+                            success_count=success_count,
+                            fail_count=fail_count,
+                            last_message_id=getattr(target_msg, "id", None),
+                            error_summary="\n".join(fail_reasons[-3:]),
+                        )
+                        continue
+
+                    copied_file_name, copied_file_size, copied_mime_type = copied_media
+                    copied_file_id = None
+                    copied_unique_id = None
+                    if copied_msg.video:
+                        copied_file_id = copied_msg.video.file_id
+                        copied_unique_id = copied_msg.video.file_unique_id
+                    elif copied_msg.document:
+                        copied_file_id = copied_msg.document.file_id
+                        copied_unique_id = copied_msg.document.file_unique_id
+                    elif copied_msg.photo:
+                        copied_file_id = copied_msg.photo.file_id
+                        copied_unique_id = copied_msg.photo.file_unique_id
+                    elif copied_msg.audio:
+                        copied_file_id = copied_msg.audio.file_id
+                        copied_unique_id = copied_msg.audio.file_unique_id
+
+                    if not copied_file_id or not copied_unique_id:
+                        fail_count += 1
+                        fail_reasons.append(f"#{target_msg.id}: 快速复制后缺少 file_id")
+                        db.update_download_task(
+                            task_key,
+                            success_count=success_count,
+                            fail_count=fail_count,
+                            last_message_id=getattr(target_msg, "id", None),
+                            error_summary="\n".join(fail_reasons[-3:]),
+                        )
+                        continue
+
+                    key_length = secrets.randbelow(17) + 16
+                    access_key = ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(key_length))
+                    new_file_id = db.add_file(
+                        message_id=copied_msg.id,
+                        chat_id=target_chat_id,
+                        file_id=copied_file_id,
+                        file_unique_id=copied_unique_id,
+                        file_name=copied_file_name or file_name,
+                        caption=_message_content_preview(target_msg),
+                        file_size=copied_file_size or file_size,
+                        mime_type=copied_mime_type or mime_type,
+                        storage_mode='telegram_fast',
+                        access_key=access_key,
+                        is_encrypted=False,
+                        encryption_key=None,
+                    )
+                    db.add_file_to_collection(default_collection["id"], new_file_id)
+                    success_keys.append((copied_file_name or file_name, access_key))
+                    success_count += 1
+                    db.update_download_task(
+                        task_key,
+                        status="running",
+                        success_count=success_count,
+                        fail_count=fail_count,
+                        last_message_id=getattr(target_msg, "id", None),
+                    )
+                    continue
+
+                # ---- 降级：下载 → 上传（处理受保护/禁止转发内容）----
+                # fast_copy_failed == True，走下载上传流程
+                try:
+                    await dashboard_msg.edit_text(
+                        f"🚀 **批量下载任务**\n"
+                        f"📦 目标: `{dest_name}`\n"
+                        f"⬇️ 受保护内容，降级下载: `{file_name}`\n"
+                        f"📊 进度: {current_idx}/{total_count} | ✅ {success_count} | ❌ {fail_count}",
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("🛑 停止任务", callback_data=f"dlstop_{user_id}")]
+                        ])
+                    )
+                except: pass
+
+                temp_dir = config.TEMP_DOWNLOAD_DIR
+                if not os.path.exists(temp_dir):
+                    os.makedirs(temp_dir, exist_ok=True)
+
+                safe_name = _safe_download_name(file_name, f"media_{target_msg.id}")
+                dl_path = await user.download_media(target_msg, file_name=os.path.join(temp_dir, safe_name))
+
+                if not dl_path or not os.path.exists(dl_path) or os.path.getsize(dl_path) < 1:
                     fail_count += 1
-                    hint = _download_error_hint(e)
-                    fail_reasons.append(f"#{target_msg.id}: 快速复制失败：{hint}")
+                    actual_size = os.path.getsize(dl_path) if dl_path and os.path.exists(dl_path) else 0
+                    fail_reasons.append(f"#{target_msg.id}: 降级下载失败 ({actual_size}B)，原因: {copy_hint}")
+                    try:
+                        if dl_path and os.path.exists(dl_path):
+                            os.remove(dl_path)
+                    except: pass
                     db.update_download_task(
                         task_key,
                         success_count=success_count,
@@ -1052,51 +1202,97 @@ async def do_batch_download(client, message, chat_id, limit, dest="collection", 
                     )
                     continue
 
-                copied_media = _message_media_info(copied_msg)
-                if not copied_media:
+                # 上传到存储频道（不加密，保持快速）
+                upload_caption = _message_content_preview(target_msg) or file_name
+                try:
+                    uploaded_msg = await client.send_document(
+                        target_chat_id,
+                        dl_path,
+                        caption=upload_caption,
+                        force_document=False,
+                        file_name=file_name,
+                    )
+                except Exception as up_err:
                     fail_count += 1
-                    fail_reasons.append(f"#{target_msg.id}: 快速复制后未返回媒体")
+                    fail_reasons.append(f"#{target_msg.id}: 降级上传失败: {_download_error_hint(up_err)}")
+                    try:
+                        if os.path.exists(dl_path):
+                            os.remove(dl_path)
+                    except: pass
+                    db.update_download_task(
+                        task_key,
+                        success_count=success_count,
+                        fail_count=fail_count,
+                        last_message_id=getattr(target_msg, "id", None),
+                        error_summary="\n".join(fail_reasons[-3:]),
+                    )
                     continue
 
-                copied_file_name, copied_file_size, copied_mime_type = copied_media
-                copied_file_id = None
-                copied_unique_id = None
-                if copied_msg.video:
-                    copied_file_id = copied_msg.video.file_id
-                    copied_unique_id = copied_msg.video.file_unique_id
-                elif copied_msg.document:
-                    copied_file_id = copied_msg.document.file_id
-                    copied_unique_id = copied_msg.document.file_unique_id
-                elif copied_msg.photo:
-                    copied_file_id = copied_msg.photo.file_id
-                    copied_unique_id = copied_msg.photo.file_unique_id
-                elif copied_msg.audio:
-                    copied_file_id = copied_msg.audio.file_id
-                    copied_unique_id = copied_msg.audio.file_unique_id
+                try:
+                    if os.path.exists(dl_path):
+                        os.remove(dl_path)
+                except: pass
 
-                if not copied_file_id or not copied_unique_id:
+                # 获取上传后的 file_id
+                up_media = _message_media_info(uploaded_msg)
+                if not up_media:
                     fail_count += 1
-                    fail_reasons.append(f"#{target_msg.id}: 快速复制后缺少 file_id")
+                    fail_reasons.append(f"#{target_msg.id}: 降级上传后未返回媒体")
+                    db.update_download_task(
+                        task_key,
+                        success_count=success_count,
+                        fail_count=fail_count,
+                        last_message_id=getattr(target_msg, "id", None),
+                        error_summary="\n".join(fail_reasons[-3:]),
+                    )
+                    continue
+
+                up_file_name, up_file_size, up_mime_type = up_media
+                up_file_id = None
+                up_unique_id = None
+                if uploaded_msg.video:
+                    up_file_id = uploaded_msg.video.file_id
+                    up_unique_id = uploaded_msg.video.file_unique_id
+                elif uploaded_msg.document:
+                    up_file_id = uploaded_msg.document.file_id
+                    up_unique_id = uploaded_msg.document.file_unique_id
+                elif uploaded_msg.photo:
+                    up_file_id = uploaded_msg.photo.file_id
+                    up_unique_id = uploaded_msg.photo.file_unique_id
+                elif uploaded_msg.audio:
+                    up_file_id = uploaded_msg.audio.file_id
+                    up_unique_id = uploaded_msg.audio.file_unique_id
+
+                if not up_file_id:
+                    fail_count += 1
+                    fail_reasons.append(f"#{target_msg.id}: 降级上传后缺少 file_id")
+                    db.update_download_task(
+                        task_key,
+                        success_count=success_count,
+                        fail_count=fail_count,
+                        last_message_id=getattr(target_msg, "id", None),
+                        error_summary="\n".join(fail_reasons[-3:]),
+                    )
                     continue
 
                 key_length = secrets.randbelow(17) + 16
                 access_key = ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(key_length))
                 new_file_id = db.add_file(
-                    message_id=copied_msg.id,
+                    message_id=uploaded_msg.id,
                     chat_id=target_chat_id,
-                    file_id=copied_file_id,
-                    file_unique_id=copied_unique_id,
-                    file_name=copied_file_name or file_name,
-                    caption=_message_content_preview(target_msg),
-                    file_size=copied_file_size or file_size,
-                    mime_type=copied_mime_type or mime_type,
+                    file_id=up_file_id,
+                    file_unique_id=up_unique_id,
+                    file_name=file_name,
+                    caption=upload_caption,
+                    file_size=up_file_size or file_size,
+                    mime_type=up_mime_type or mime_type,
                     storage_mode='telegram_fast',
                     access_key=access_key,
                     is_encrypted=False,
                     encryption_key=None,
                 )
                 db.add_file_to_collection(default_collection["id"], new_file_id)
-                success_keys.append((copied_file_name or file_name, access_key))
+                success_keys.append((file_name, access_key))
                 success_count += 1
                 db.update_download_task(
                     task_key,
@@ -2571,7 +2767,7 @@ async def menu_download_handler(client, message):
     await message.reply_text(
         "📥 **批量下载工具箱 (管理员)**\n\n"
         "这里只保留下载功能，不再提供最近对话、搜索对话、删除账户、媒体定位、频道 ID 查询或关联群查询。\n\n"
-        "请自行提供消息链接，或输入：`频道ID 消息ID 数量` / `频道ID 数量`。",
+        "请自行提供消息链接，或输入：`频道ID 消息ID 数量`（精准模式）。",
         reply_markup=ReplyKeyboardMarkup(
             buttons,
             resize_keyboard=True,
@@ -2591,17 +2787,13 @@ async def sub_start_download_handler(client, message):
         "📥 **批量下载**\n\n"
         "最简单：复制目标视频的消息链接直接发给我。\n"
         "消息 ID 就是链接最后一段数字。\n\n"
-        "例：`https://t.me/c/1234567890/4567`\n"
-        "频道 ID：`-1001234567890`\n"
-        "消息 ID：`4567`\n\n"
-        "支持两种格式：\n\n"
+        "消息链接：`https://t.me/c/1234567890/4567`\n"
+        "其中频道 ID 为 `-1001234567890`，消息 ID 为 `4567`\n\n"
         "默认使用 ⚡ 快速合集：不下载、不解密，速度快。\n"
         "如果源消息禁止复制，任务会标记失败，可再改用加密合集尝试。\n\n"
-        "1. 扫描最近媒体：`频道ID 数量`\n"
-        "   例如：`-1001234567890 50`\n\n"
-        "2. 精准下载消息：`频道ID 消息ID 数量`\n"
-        "   例如：`-1001234567890 4567 1`\n\n"
-        "💡 使用 \"📋 最近对话\" 可以查看频道ID\n"
+        "精准下载：`频道ID 消息ID 数量`\n"
+        "例如：`-1001234567890 4567 1`（下载消息4567起共1条）\n"
+        "例如：`-1001234567890 4567 5`（下载消息4567起共5条）\n\n"
         "发 `取消` 或点 **❌ 取消操作** 可退出。",
         reply_markup=get_cancel_keyboard(is_adm)
     )
