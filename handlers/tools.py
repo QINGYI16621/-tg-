@@ -193,6 +193,8 @@ async def terms_middleware(client: Client, message: Message):
 # 全局存储
 user_dialogs_cache = {}
 user_download_dest = {}
+pending_download_jobs = {}
+cancel_download_users = set()
 user_last_action = {}  # 频率限制：记录用户上次操作时间
 user_collecting_mode = {}  # 收集模式：{user_id: {"collection_id": xxx, "collection_name": xxx, "files": []}}
 user_last_collection = {}  # 最后一次使用的合集 {user_id: {'id': id, 'name': name}}
@@ -201,6 +203,8 @@ user_interaction_state = {} # 用户交互状态: {user_id: "status_string"}
 user_pending_file = {} # 用于存储待处理的文件信息，例如在创建合集时
 
 from datetime import datetime, timedelta
+
+DEFAULT_DOWNLOAD_COLLECTION_NAME = "我的下载"
 
 # User Request History for Rate Limiting
 user_request_history = {}
@@ -236,6 +240,36 @@ async def clear_user_state(user_id):
     user_interaction_state.pop(user_id, None)
     user_pending_file.pop(user_id, None)
     user_download_dest.pop(user_id, None)
+    cancel_download_users.discard(user_id)
+    for job_id, job in list(pending_download_jobs.items()):
+        if job.get("user_id") == user_id:
+            pending_download_jobs.pop(job_id, None)
+
+def _generate_collection_key(prefix="file_store"):
+    import secrets
+    import string
+
+    random_length = secrets.randbelow(17) + 16
+    random_chars = ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(random_length))
+    return f"{prefix}{random_chars}"
+
+def get_or_create_default_download_collection(owner_id):
+    collection = db.get_collection_by_name(DEFAULT_DOWNLOAD_COLLECTION_NAME, owner_id)
+    if collection:
+        return collection
+
+    access_key = _generate_collection_key()
+    collection_id = db.create_collection(DEFAULT_DOWNLOAD_COLLECTION_NAME, access_key, owner_id)
+    if not collection_id:
+        return db.get_collection_by_name(DEFAULT_DOWNLOAD_COLLECTION_NAME, owner_id)
+
+    return {
+        "id": collection_id,
+        "name": DEFAULT_DOWNLOAD_COLLECTION_NAME,
+        "access_key": access_key,
+        "owner_id": owner_id,
+        "created_at": None,
+    }
 
 async def check_auth(client, message):
     """
@@ -424,8 +458,8 @@ async def handle_reply_input(client: Client, message: Message):
     elif ("频道ID" in prompt_text and "数量" in prompt_text) or "请按格式输入" in prompt_text:
         try:
             chat_id, start_message_id, limit = await _parse_download_source(client, message.text)
-            dest = user_download_dest.get(message.from_user.id, "channel")
-            await do_batch_download(client, message, chat_id, limit, dest, start_message_id=start_message_id)
+            dest = user_download_dest.get(message.from_user.id, "collection")
+            await request_download_confirmation(client, message, chat_id, limit, dest, start_message_id=start_message_id)
         except Exception:
             await message.reply_text(
                 "❌ 格式错误！\n\n"
@@ -793,7 +827,8 @@ async def batch_download(client: Client, message: Message):
                 "📥 **批量下载**\n\n"
                 "**第一步：选择下载目的地**",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📁 存储频道", callback_data="dl_dest_channel")],
+                    [InlineKeyboardButton("📂 我的下载（默认）", callback_data="dl_dest_collection")],
+                    [InlineKeyboardButton("📁 仅存储频道", callback_data="dl_dest_channel")],
                     [InlineKeyboardButton("⭐ 收藏夹 (Saved Messages)", callback_data="dl_dest_saved")]
                 ])
             )
@@ -807,14 +842,14 @@ async def batch_download(client: Client, message: Message):
         else:
             limit = int(args[2])
         
-        # 默认发到存储频道
-        dest = user_download_dest.get(message.from_user.id, "channel")
-        await do_batch_download(client, message, chat_id, limit, dest, start_message_id=start_message_id)
+        # 默认归入“我的下载”合集；存储频道只作为底层加密仓库。
+        dest = user_download_dest.get(message.from_user.id, "collection")
+        await request_download_confirmation(client, message, chat_id, limit, dest, start_message_id=start_message_id)
         
     except Exception as e:
         await message.reply_text(f"❌ 发生严重错误: {e}")
 
-@Client.on_callback_query(filters.regex(r"^dl_dest_(channel|saved)$"))
+@Client.on_callback_query(filters.regex(r"^dl_dest_(collection|channel|saved)$"))
 async def download_dest_callback(client: Client, callback: CallbackQuery):
     """Handle destination selection."""
     if not await require_admin(client, callback, alert=True):
@@ -822,7 +857,12 @@ async def download_dest_callback(client: Client, callback: CallbackQuery):
     dest = callback.data.replace("dl_dest_", "")
     user_download_dest[callback.from_user.id] = dest
     
-    dest_name = "📁 存储频道" if dest == "channel" else "⭐ 收藏夹"
+    dest_names = {
+        "collection": "📂 我的下载",
+        "channel": "📁 仅存储频道",
+        "saved": "⭐ 收藏夹",
+    }
+    dest_name = dest_names.get(dest, "📂 我的下载")
     
     from pyrogram.types import ForceReply
     await callback.message.edit_text(
@@ -845,6 +885,58 @@ async def download_dest_callback(client: Client, callback: CallbackQuery):
         reply_markup=get_cancel_keyboard(callback.from_user.id == client.admin_id)
     )
     await callback.answer(f"已选择: {dest_name}")
+
+@Client.on_callback_query(filters.regex(r"^dl(ok|no)_"))
+async def download_confirm_callback(client: Client, callback: CallbackQuery):
+    if not await require_admin(client, callback, alert=True):
+        return
+
+    action, job_id = callback.data.split("_", 1)
+    job = pending_download_jobs.pop(job_id, None)
+    if not job or job.get("user_id") != callback.from_user.id:
+        await callback.answer("任务已过期，请重新发起。", show_alert=True)
+        return
+
+    if action == "dlno":
+        await callback.message.edit_text("✅ 已取消下载任务。")
+        await callback.answer("已取消")
+        return
+
+    await callback.answer("开始下载")
+
+    from types import SimpleNamespace
+
+    class MockMessage:
+        def __init__(self, bot_client, user_id):
+            self.chat = SimpleNamespace(id=user_id, type="private", title="User")
+            self.from_user = SimpleNamespace(id=user_id, is_bot=False, username="User", first_name="")
+            self._client = bot_client
+            self.text = ""
+
+        async def reply_text(self, text, **kwargs):
+            return await self._client.send_message(self.chat.id, text, **kwargs)
+
+    await callback.message.edit_text("🚀 已确认，开始创建下载任务...")
+    mock_msg = MockMessage(client, callback.from_user.id)
+    await do_batch_download(
+        client,
+        mock_msg,
+        job["chat_id"],
+        job["limit"],
+        job["dest"],
+        start_message_id=job.get("start_message_id"),
+    )
+
+@Client.on_callback_query(filters.regex(r"^dlstop_"))
+async def download_stop_callback(client: Client, callback: CallbackQuery):
+    if not await require_admin(client, callback, alert=True):
+        return
+    uid = int(callback.data.split("_", 1)[1])
+    if uid != callback.from_user.id:
+        await callback.answer("不能取消别人的任务。", show_alert=True)
+        return
+    cancel_download_users.add(uid)
+    await callback.answer("已请求停止，当前文件结束后会停。", show_alert=True)
 
 def _safe_download_name(file_name, fallback):
     """Sanitize Telegram filenames for local temp paths."""
@@ -937,7 +1029,62 @@ async def _parse_download_source(client, text):
         return chat_id, int(parts[1]), int(parts[2])
     return chat_id, None, int(parts[1])
 
-async def do_batch_download(client, message, chat_id, limit, dest="channel", start_message_id=None):
+def _download_dest_name(dest):
+    return {
+        "collection": f"📂 合集：{DEFAULT_DOWNLOAD_COLLECTION_NAME}",
+        "channel": "📁 仅存储频道",
+        "saved": "⭐ 收藏夹",
+    }.get(dest, f"📂 合集：{DEFAULT_DOWNLOAD_COLLECTION_NAME}")
+
+async def request_download_confirmation(client, message, chat_id, limit, dest="collection", start_message_id=None):
+    import secrets
+    import config
+
+    limit = int(limit)
+    if limit <= 0:
+        await message.reply_text("❌ 下载数量必须大于 0。")
+        return
+
+    max_count = getattr(config, "MAX_DOWNLOAD_COUNT", 50)
+    if limit > max_count:
+        await message.reply_text(
+            f"⚠️ 数量 `{limit}` 超过当前安全上限 `{max_count}`。\n\n"
+            f"请重新输入较小数量，或修改配置里的 `MAX_DOWNLOAD_COUNT`。"
+        )
+        return
+
+    mode_text = (
+        f"精准下载：从消息 `{start_message_id}` 往前取 `{limit}` 条"
+        if start_message_id
+        else f"扫描最近媒体：最多下载 `{limit}` 个媒体"
+    )
+    job_id = secrets.token_urlsafe(6).replace("_", "").replace("-", "")[:8]
+    pending_download_jobs[job_id] = {
+        "user_id": message.from_user.id,
+        "chat_id": chat_id,
+        "limit": limit,
+        "dest": dest,
+        "start_message_id": start_message_id,
+    }
+
+    second_number_tip = (
+        "如果第二个数字其实是消息 ID，请取消后输入：`频道ID 消息ID 1`。\n\n"
+        if not start_message_id else ""
+    )
+    await message.reply_text(
+        "⚠️ **请确认下载任务**\n\n"
+        f"来源 ID: `{chat_id}`\n"
+        f"模式: {mode_text}\n"
+        f"目的地: {_download_dest_name(dest)}\n\n"
+        f"{second_number_tip}"
+        "确认无误后再开始，避免输错 ID 后批量下载大量文件。",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ 确认开始", callback_data=f"dlok_{job_id}")],
+            [InlineKeyboardButton("❌ 取消", callback_data=f"dlno_{job_id}")]
+        ])
+    )
+
+async def do_batch_download(client, message, chat_id, limit, dest="collection", start_message_id=None):
     """Core download logic."""
     # Use User Client (Admin's account) for downloading
     user = client.user_client
@@ -945,14 +1092,26 @@ async def do_batch_download(client, message, chat_id, limit, dest="channel", sta
     # 确定目的地
     from handlers.transfer import progress, humanbytes, config, db, os, time, math
     
+    user_id = message.from_user.id
+    cancel_download_users.discard(user_id)
+    default_collection = None
     if dest == "saved":
         # 发送到用户的 Saved Messages，用 user client
         target_chat_id = "me"
         dest_name = "⭐ 收藏夹"
         send_client = user
+    elif dest == "collection":
+        default_collection = get_or_create_default_download_collection(message.from_user.id)
+        if not default_collection:
+            await message.reply_text("❌ 无法创建默认合集“我的下载”，请稍后重试。")
+            return
+
+        target_chat_id = config.STORAGE_CHANNEL_ID
+        dest_name = _download_dest_name(dest)
+        send_client = client
     else:
         target_chat_id = config.STORAGE_CHANNEL_ID
-        dest_name = "📁 存储频道"
+        dest_name = _download_dest_name(dest)
         send_client = client
     
     mode_text = f"从消息 `{start_message_id}` 精准读取 {limit} 条" if start_message_id else f"扫描最后 {limit} 个媒体"
@@ -1034,7 +1193,10 @@ async def do_batch_download(client, message, chat_id, limit, dest="channel", sta
         f"🚀 **批量下载任务启动**\n"
         f"📦 目标: `{dest_name}`\n"
         f"📊 进度: 0/{len(messages_to_process)}\n"
-        f"⏳ 正在初始化..."
+        f"⏳ 正在初始化...",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🛑 停止任务", callback_data=f"dlstop_{user_id}")]
+        ])
     )
     
     import secrets
@@ -1045,10 +1207,15 @@ async def do_batch_download(client, message, chat_id, limit, dest="channel", sta
     success_count = 0
     fail_count = 0
     fail_reasons = []
+    success_keys = []
     total_count = len(messages_to_process)
     
     # Process from oldest to newest
     for index, target_msg in enumerate(reversed(messages_to_process)):
+        if user_id in cancel_download_users:
+            fail_reasons.append("用户已手动停止任务")
+            break
+
         current_idx = index + 1
         
         try:
@@ -1062,7 +1229,10 @@ async def do_batch_download(client, message, chat_id, limit, dest="channel", sta
                     f"🚀 **批量下载任务**\n"
                     f"📦 目标: `{dest_name}`\n"
                     f"🔄 正在处理: `{file_name}`\n"
-                    f"📊 进度: {current_idx}/{total_count} | ✅ {success_count} | ❌ {fail_count}"
+                    f"📊 进度: {current_idx}/{total_count} | ✅ {success_count} | ❌ {fail_count}",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🛑 停止任务", callback_data=f"dlstop_{user_id}")]
+                    ])
                 )
             except: pass
 
@@ -1104,7 +1274,7 @@ async def do_batch_download(client, message, chat_id, limit, dest="channel", sta
             # Backup Upload
             backup_msg_id = 0
             backup_chat_id = 0
-            if dest == "channel" and config.BACKUP_CHANNEL_ID and config.BACKUP_CHANNEL_ID != 0:
+            if dest in ("channel", "collection") and config.BACKUP_CHANNEL_ID and config.BACKUP_CHANNEL_ID != 0:
                 try:
                     # Prefer using storage_client for backup if possible, or same client
                     backup_uploader = client.storage_client if hasattr(client, 'storage_client') else send_client
@@ -1129,7 +1299,7 @@ async def do_batch_download(client, message, chat_id, limit, dest="channel", sta
                     except: pass
                     continue
 
-                db.add_file(
+                new_file_id = db.add_file(
                     message_id=primary_msg.id,
                     chat_id=target_chat_id,
                     file_id=primary_msg.document.file_id,
@@ -1145,6 +1315,9 @@ async def do_batch_download(client, message, chat_id, limit, dest="channel", sta
                     backup_message_id=backup_msg_id,
                     backup_chat_id=backup_chat_id
                 )
+                if dest == "collection":
+                    db.add_file_to_collection(default_collection["id"], new_file_id)
+                success_keys.append((file_name, access_key))
                 success_count += 1
             else:
                 fail_count += 1
@@ -1164,16 +1337,43 @@ async def do_batch_download(client, message, chat_id, limit, dest="channel", sta
     if fail_reasons:
         reason_text = "\n\n⚠️ **失败明细（前5条）**\n" + "\n".join(f"- {item}" for item in fail_reasons[:5])
 
+    access_tip = ""
+    if dest == "collection" and default_collection:
+        access_tip = (
+            f"\n\n🔑 **提取码 / 合集密钥**\n"
+            f"`{default_collection['access_key']}`\n"
+            f"你之后直接把这个密钥发给机器人，就能提取本次下载归档。"
+        )
+    elif dest == "channel" and success_keys:
+        shown = "\n".join(
+            f"- `{key}` | {_short_text(name, 24)}"
+            for name, key in success_keys[:10]
+        )
+        more = f"\n...还有 {len(success_keys) - 10} 个未显示" if len(success_keys) > 10 else ""
+        access_tip = f"\n\n🔑 **单文件提取码（前10个）**\n{shown}{more}"
+
     await dashboard_msg.edit_text(
         f"✅ **批量任务结束**\n"
         f"📊 总数: {total_count}\n"
         f"✅ 成功: {success_count}\n"
         f"❌ 失败: {fail_count}\n"
         f"📂 目的地: {dest_name}"
+        f"{access_tip}"
         f"{reason_text}"
     )
     
-    await message.reply_text(f"🎉 **批量任务结束！**\n共处理: {total_count}\n成功: {success_count}\n目的地: {dest_name}")
+    collection_tip = ""
+    if dest == "collection" and default_collection:
+        collection_tip = (
+            f"\n🔑 提取码 / 合集密钥: `{default_collection['access_key']}`\n"
+            f"把这个密钥发给机器人即可提取。"
+        )
+    elif dest == "channel" and success_keys:
+        first_name, first_key = success_keys[0]
+        collection_tip = f"\n🔑 首个文件提取码: `{first_key}`"
+
+    await message.reply_text(f"🎉 **批量任务结束！**\n共处理: {total_count}\n成功: {success_count}\n目的地: {dest_name}{collection_tip}")
+    cancel_download_users.discard(user_id)
 
 
 def _short_text(text, max_len=36):
@@ -1335,7 +1535,7 @@ async def download_located_media_callback(client, callback: CallbackQuery):
         async def reply_text(self, text, **kwargs):
             return await self._client.send_message(self.chat.id, text, **kwargs)
 
-    dest = user_download_dest.get(callback.from_user.id, "channel")
+    dest = user_download_dest.get(callback.from_user.id, "collection")
     mock_msg = MockMessage(client, callback.from_user.id)
     await do_batch_download(client, mock_msg, chat_id, 1, dest, start_message_id=msg_id)
 
@@ -2816,9 +3016,9 @@ async def download_state_handler(client, message):
         # Success! Consume state now
         del user_interaction_state[uid]
         
-        # Use default destination (channel)
-        dest = user_download_dest.get(uid, "channel")
-        await do_batch_download(client, message, chat_id, limit, dest, start_message_id=start_message_id)
+        # Use default destination (collection)
+        dest = user_download_dest.get(uid, "collection")
+        await request_download_confirmation(client, message, chat_id, limit, dest, start_message_id=start_message_id)
         message.stop_propagation()
         return
     
@@ -2980,8 +3180,8 @@ async def start_download_btn(client, callback):
             return await self._client.send_message(self.chat.id, text, **kwargs)
             
     mock_msg = MockMessage(client, chat_id, f"/download {chat_id} {count}", callback.from_user.id)
-    dest = user_download_dest.get(callback.from_user.id, "channel")
-    await do_batch_download(client, mock_msg, chat_id, count, dest)
+    dest = user_download_dest.get(callback.from_user.id, "collection")
+    await request_download_confirmation(client, mock_msg, chat_id, count, dest)
     
     if auto_leave:
         try:
