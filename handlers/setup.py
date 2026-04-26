@@ -15,20 +15,12 @@ async def start_handler(client: Client, message: Message):
     if not await check_auth(client, message):
         return
 
-    
-    
-
     # === Terms Check (Session Based) ===
     from handlers.session import is_session_active
     from database import db
-    
+
     # Check if user agreed in THIS session
     if not is_session_active(message.from_user.id):
-        # Also check DB for record purposes? 
-        # User wants "Every time bot restarts", so strictly Session based for the Disclaimer SHOWING.
-        # But we can still respect the DB if we wanted, but User explicitly asked for "Every time".
-        # So we IGNORE DB for the *Interactive Check*.
-        
         s_text = (
             "📜 **免责声明 (Disclaimer)**\n\n"
             "1. 本机器人仅用于个人数据备份与管理，代码开源且透明。\n"
@@ -47,40 +39,55 @@ async def start_handler(client: Client, message: Message):
 
 async def send_main_menu(client, message):
     from pyrogram.types import ReplyKeyboardMarkup, KeyboardButton
-    
+
     # Check Admin
     is_adm = message.from_user.id == client.admin_id
-    
-    buttons = [[KeyboardButton("☁️ 存储/上传")]]
+
     if is_adm:
-        buttons.insert(0, [KeyboardButton("📥 批量下载")])
-        buttons.append([KeyboardButton("👮 管理员")])
-    buttons.append([KeyboardButton("❌ 取消操作")])
-        
+        welcome = (
+            "👋 **欢迎回来，管理员！**\n\n"
+            "请通过下方菜单选择功能：\n\n"
+            "📥 **批量下载**: 从频道批量抓取文件\n"
+            "☁️ **存储/上传**: 加密存储与合集管理\n"
+            "👮 **管理员**: 用户管理与系统状态"
+        )
+    else:
+        welcome = (
+            "👋 **欢迎使用文件下载机器人！**\n\n"
+            "📌 **使用方法：**\n"
+            "直接发送 Telegram 消息链接，机器人会自动帮你下载并发送文件。\n\n"
+            "支持格式：\n"
+            "• `https://t.me/频道名/消息ID`\n"
+            "• `https://t.me/c/频道ID/消息ID`\n\n"
+            "☁️ 也可以上传文件到机器人进行加密存储。"
+        )
+
     await message.reply_text(
-        "👋 **欢迎回到私人文件保险箱！**\n\n"
-        "我是你的个人数据管家，提供最高级别的数据加密存储与管理服务。\n"
-        "请通过下方菜单选择功能：\n\n"
-        "🔐 **数据安全**: 本地加密，云端存储\n"
-        "⚡️ **极速体验**: 自动分流，满速上传\n"
-        "🎥 **流媒体**: 支持原画质在线播放",
+        welcome,
         reply_markup=get_main_menu_keyboard(is_adm)
     )
 
 def get_main_menu_keyboard(is_admin_user=False):
     from pyrogram.types import ReplyKeyboardMarkup, KeyboardButton
-    buttons = [[KeyboardButton("☁️ 存储/上传")]]
     if is_admin_user:
-        buttons.insert(0, [KeyboardButton("📥 批量下载")])
-        buttons.append([KeyboardButton("👮 管理员")])
-    buttons.append([KeyboardButton("❌ 取消操作")])
-    
+        buttons = [
+            [KeyboardButton("📥 批量下载")],
+            [KeyboardButton("☁️ 存储/上传")],
+            [KeyboardButton("👮 管理员")],
+            [KeyboardButton("❌ 取消操作")],
+        ]
+    else:
+        buttons = [
+            [KeyboardButton("☁️ 存储/上传")],
+            [KeyboardButton("❌ 取消操作")],
+        ]
+
     return ReplyKeyboardMarkup(
-        buttons, 
-        resize_keyboard=True, 
+        buttons,
+        resize_keyboard=True,
         one_time_keyboard=False,
         is_persistent=True,
-        placeholder="请选择功能..."
+        placeholder="发送链接下载，或选择功能..."
     )
 
 @Client.on_callback_query(filters.regex("agree_terms"))
@@ -90,44 +97,43 @@ async def terms_btn_callback(client: Client, callback):
 
     activate_session(callback.from_user.id)
     db.accept_terms(callback.from_user.id)
-    
+
     await callback.answer("✅ 已同意条款")
     try: await callback.message.delete()
     except: pass
-    
-    # 这里的 message 可能是旧的，我们需要用 callback.message 的 chat_id 发新消息
-    # 但 callback.message 是 Bot 发的消息，没有 from_user 指向 User.
-    # 所以我们构造一个 fake message context 或者直接用 client.send_message
-    
-    # 重新构造 Message 对象是不行的，我们直接发
+
     is_adm = callback.from_user.id == client.admin_id
-    buttons = [[KeyboardButton("☁️ 存储/上传")]]
+
     if is_adm:
-        buttons.insert(0, [KeyboardButton("📥 批量下载")])
-        buttons.append([KeyboardButton("👮 管理员")])
-    buttons.append([KeyboardButton("❌ 取消操作")])
-        
+        welcome = (
+            "👋 **欢迎回来，管理员！**\n\n"
+            "请通过下方菜单选择功能："
+        )
+    else:
+        welcome = (
+            "👋 **欢迎使用！**\n\n"
+            "直接发送 Telegram 消息链接，机器人会自动帮你下载并发送文件。\n\n"
+            "支持格式：\n"
+            "• `https://t.me/频道名/消息ID`\n"
+            "• `https://t.me/c/频道ID/消息ID`\n\n"
+            "💡 也可以直接发送文件给我，我会自动加密存储。"
+        )
+
     await client.send_message(
         callback.message.chat.id,
-        "💡 当然，你也可以随时直接发送文件给我，我会自动处理。",
-        reply_markup=ReplyKeyboardMarkup(
-            buttons,
-            resize_keyboard=True,
-            one_time_keyboard=False,
-            is_persistent=True,
-            placeholder="请选择功能..."
-        )
+        welcome,
+        reply_markup=get_main_menu_keyboard(is_adm)
     )
-
-
-    pass # Old logic removed
 
 
 @Client.on_message(filters.forwarded & filters.private)
 async def channel_id_sniffer(client: Client, message: Message):
-    """Detect forwarded messages"""
+    """Detect forwarded messages - only for admin config helper"""
     # 权限检查
     if not await check_auth(client, message):
+        return
+    # 只有管理员才显示频道ID信息（普通用户转发文件走 media_handler）
+    if message.from_user.id != client.admin_id:
         return
     if message.forward_from_chat:
         chat_id = message.forward_from_chat.id
@@ -162,77 +168,79 @@ async def channel_id_sniffer(client: Client, message: Message):
             "3. 把链接发给我。"
         )
 
-@Client.on_message(filters.text & filters.private & ~filters.reply & ~filters.command("start") & ~filters.command("recent") & ~filters.command("download") & ~filters.command("search") & ~filters.command("getid") & ~filters.command("linked") & ~filters.command("deleted") & ~filters.command("newcollection") & ~filters.command("addto") & ~filters.command("mycollections") & ~filters.command("tasks") & ~filters.command("security"))
+@Client.on_message(
+    filters.text & filters.private
+    & ~filters.reply
+    & ~filters.command("start") & ~filters.command("recent")
+    & ~filters.command("download") & ~filters.command("search")
+    & ~filters.command("getid") & ~filters.command("linked")
+    & ~filters.command("deleted") & ~filters.command("newcollection")
+    & ~filters.command("addto") & ~filters.command("mycollections")
+    & ~filters.command("tasks") & ~filters.command("security")
+)
 async def link_handler(client: Client, message: Message):
-    """Handle links and collection keys"""
+    """Handle extraction keys and collection keys. TG links are handled by transfer.py."""
     # 权限检查
     if not await check_auth(client, message):
         return
     import re
-    text = message.text.strip()
-    
-    # 首先检查是否是提取码 (16-32位字母数字)
-    import re
     import os
     import asyncio
+    text = message.text.strip()
+
+    # 如果是 TG 消息链接，不在这里处理，让 transfer.py / public_transfer.py 处理
+    if re.search(r"t\.me/", text):
+        message.continue_propagation()
+        return
+
     # 清理文本，去除可能的 @username 前缀
-    # 例如用户输入: "@MyBot 1234abcd..."
     clean_text = re.sub(r'^@\w+\s+', '', text).strip()
-    
+
     # 检查是否是提取码 (16-32位字母数字)
-    # 使用 clean_text 进行匹配
     if re.match(r'^[a-zA-Z0-9]{16,32}$', clean_text):
-        key = clean_text # 使用清理后的 key
+        key = clean_text
         from database import db
         file_info = db.get_file_by_key(key)
         if file_info:
             try:
-                # 检查是否加密
                 if file_info.get("is_encrypted"):
                     status_msg = await message.reply_text(
                         f"🔐 **发现加密档案**\n"
                         f"📄 文件: `{file_info['file_name']}`\n"
                         f"⏳ 正在云端解密并提取，请稍候..."
                     )
-                    
-                    # 使用 storage_client 下载加密文件
+
                     storage_client = client.storage_client
-                    
-                    # 从存储频道获取消息
+
                     enc_msg = await storage_client.get_messages(
-                        file_info["chat_id"], 
+                        file_info["chat_id"],
                         file_info["message_id"]
                     )
-                    
-                    # 下载加密文件
+
                     dl_path = await storage_client.download_media(
                         enc_msg,
                         file_name=f"temp_enc_{key}.bin"
                     )
-                    
-                    # 解密
+
                     from services.crypto_utils import decrypt_file
                     import base64
-                    
+
                     decrypted_path = f"temp_dec_{key}_{file_info['file_name']}"
                     aes_key = base64.b64decode(file_info["encryption_key"])
-                    
+
                     await asyncio.to_thread(decrypt_file, dl_path, decrypted_path, aes_key)
-                    
-                    # 发送解密后的文件
+
                     await message.reply_document(
                         document=decrypted_path,
                         caption=f"✅ 解密成功: {file_info['file_name']}",
                         file_name=file_info['file_name']
                     )
-                    
-                    # 清理临时文件
+
                     if os.path.exists(dl_path): os.remove(dl_path)
                     if os.path.exists(decrypted_path): os.remove(decrypted_path)
-                    
+
                     await status_msg.delete()
                 else:
-                    # 普通文件直接发送
                     await client.send_cached_media(
                         message.chat.id,
                         file_info["file_id"],
@@ -244,28 +252,13 @@ async def link_handler(client: Client, message: Message):
                 traceback.print_exc()
                 await message.reply_text(f"❌ 文件发送失败: {e}")
                 return
-    
-    # 然后检查是否是合集密钥
+
+    # 检查是否是合集密钥
     from handlers.tools import handle_collection_key
     if await handle_collection_key(client, message, text):
-        return  # 是有效密钥，已处理
-    
-    # Match pattern: https://t.me/c/123456789/10
-    match = re.search(r"t\.me/c/(\d+)/", text)
-    if match:
-        channel_id_part = match.group(1)
-        full_channel_id = int(f"-100{channel_id_part}")
-        
-        response = (
-            f"✅ **通过链接识别到频道！**\n\n"
-            f"🆔 **频道 ID**: `{full_channel_id}`\n\n"
-            f"请复制这个 ID 修改 config.py，或者直接发给我让管理员修改。"
-        )
-        await message.reply_text(response)
         return
 
-
-    # Simple check if it looks like a config update attempt or storage ID is default
+    # 配置未完成提示
     if config.STORAGE_CHANNEL_ID == -1000000000000:
         await message.reply_text(
             "⚠️ **配置未完成**\n\n"
@@ -281,8 +274,5 @@ async def group_message_handler(client: Client, message: Message):
     当机器人在群组中收到消息时，Pyrogram 会自动缓存该群组的 peer 信息。
     这解决了机器人无法直接通过 ID 发送消息的问题 (Peer id invalid)。
     """
-    # 只需要接收到消息即可，Pyrogram 内部会自动更新 session
-    # 我们这里打印一条日志方便调试
     if message.chat.id == config.STORAGE_CHANNEL_ID:
         print(f"✅ Bot 收到存储频道 [{message.chat.title}] 的消息，Peer 缓存已更新。")
-

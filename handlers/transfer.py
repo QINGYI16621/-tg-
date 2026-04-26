@@ -48,14 +48,14 @@ def humanbytes(size):
         n += 1
     return str(round(size, 2)) + " " + Dic_powerN[n] + 'B'
 
-@Client.on_message(filters.regex(r"https://t\.me/(c/|)(\d+|[\w\d_]+)/(\d+)") & filters.private)
+@Client.on_message(filters.regex(r"https://t\.me/(c/|)(\d+|[\w\d_]+)/(\d+)") & filters.private, group=0)
 async def transfer_handler(client: Client, message: Message):
-    """Handle Telegram links - 管理员专用"""
+    """Handle Telegram links - 管理员专用（存储+加密流程）"""
     user_id = message.from_user.id
     
-    # 管理员专用
+    # 非管理员：不处理，让消息继续传播到 public_transfer.py（group=5）
     if user_id != client.admin_id:
-        await message.reply_text("⛔ 此机器人为私人使用，不对外开放。")
+        message.continue_propagation()
         return
     
     url = message.text.strip()
@@ -80,25 +80,69 @@ async def transfer_handler(client: Client, message: Message):
     status_msg = await message.reply_text("🔎 正在解析消息...")
 
     try:
-        # 尝试先加入频道（如果还没加入的话）
+        # 尝试先解析 peer（如果失败则继续，后面会用 raw API 兜底）
         try:
             await user_client.get_chat(chat_id)
         except Exception as e:
             if "CHANNEL_PRIVATE" in str(e) or "INVITE_HASH" in str(e):
-                await status_msg.edit_text("⚠️ 无法访问该频道，尝试加入中...")
-                # 如果用户发的是邀请链接格式，尝试加入
-                # 但这里只有频道ID，没有邀请链接，所以需要用户单独发邀请链接
-                await status_msg.edit_text(
-                    f"❌ 无法访问该频道！\n\n"
-                    f"频道 ID: `{chat_id}`\n\n"
-                    f"**请先发送该频道的邀请链接**\n"
-                    f"例如: `https://t.me/+xxxxxx`\n\n"
-                    f"Bot 会自动加入后再下载。"
-                )
-                return
+                # 不直接报错，继续尝试 raw API 获取消息
+                pass
 
         # 2. Get Message (using User Client to bypass restrictions)
-        target_msg = await user_client.get_messages(chat_id, message_id)
+        # 先尝试直接获取
+        target_msg = None
+        try:
+            target_msg = await user_client.get_messages(chat_id, message_id)
+        except Exception as e1:
+            # 如果直接获取失败，尝试通过 GetDiscussionMessage raw API
+            # 适用于：频道评论区绑定的群组，可见但不允许加入
+            err1 = str(e1)
+            if any(k in err1 for k in ("CHANNEL_PRIVATE", "USER_NOT_PARTICIPANT", "PEER_ID_INVALID", "CHAT_FORBIDDEN")):
+                await status_msg.edit_text("⚠️ 直接访问失败，尝试通过讨论区 API 获取...")
+                try:
+                    from pyrogram import raw
+                    # chat_id 可能是用户名(str)或数字ID
+                    if isinstance(chat_id, str):
+                        peer = await user_client.resolve_peer(chat_id)
+                    else:
+                        peer = await user_client.resolve_peer(chat_id)
+                    result = await user_client.invoke(
+                        raw.functions.messages.GetDiscussionMessage(
+                            peer=peer,
+                            msg_id=message_id
+                        )
+                    )
+                    if result and result.messages:
+                        # GetDiscussionMessage 返回的消息对象需要转换
+                        # 取第一条（即讨论消息本身）
+                        raw_msg = result.messages[0]
+                        # 用讨论群的 peer 和消息 ID 重新获取
+                        discussion_peer = result.chats[0] if result.chats else None
+                        if discussion_peer:
+                            disc_chat_id = int("-100" + str(discussion_peer.id))
+                            disc_msg_id = raw_msg.id
+                            try:
+                                target_msg = await user_client.get_messages(disc_chat_id, disc_msg_id)
+                            except Exception:
+                                # 直接用 raw 消息构造下载
+                                target_msg = await user_client.get_messages(disc_chat_id, disc_msg_id)
+                except Exception as e2:
+                    # raw API 也失败，报原始错误
+                    await status_msg.edit_text(
+                        f"❌ 无法访问该频道/群组！\n\n"
+                        f"频道 ID: `{chat_id}`\n\n"
+                        f"**可能原因：**\n"
+                        f"1. 账号未加入该频道/群组\n"
+                        f"2. 该群组为私密且不允许加入\n"
+                        f"3. 消息已被删除\n\n"
+                        f"**解决方法：**\n"
+                        f"• 如有邀请链接，发送 `https://t.me/+xxxxxx` 让 Bot 加入\n"
+                        f"• 或先手动加入频道后重试\n\n"
+                        f"错误: `{err1}`"
+                    )
+                    return
+            else:
+                raise e1
         
         if not target_msg or target_msg.empty:
             await status_msg.edit_text("❌ 无法获取消息 (可能被删除或无权限)")
@@ -270,17 +314,6 @@ async def transfer_handler(client: Client, message: Message):
                     os.remove(download_path)
                 if 'encrypted_path' in locals() and os.path.exists(encrypted_path):
                     os.remove(encrypted_path)
-            except:
-                pass
-            return
-        
-        except Exception as e:
-            await status_msg.edit_text(f"❌ 存储失败: {e}")
-            try:
-                if 'download_path' in locals() and os.path.exists(download_path):
-                    os.remove(download_path)
-                if 'stealth_path' in locals() and os.path.exists(stealth_path):
-                    os.remove(stealth_path)
             except:
                 pass
             return

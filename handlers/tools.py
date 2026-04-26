@@ -172,10 +172,13 @@ async def terms_middleware(client: Client, message: Message):
     # User sent /start or anything else, but NO session and NO specific button click.
     # Show "Start Menu" (Highest Level)
     welcome_text = (
-        "👋 **欢迎来到私人文件保险箱**\n\n"
-        "您目前处于 **未登录/会话过期** 状态。\n"
-        "为了保障您的数据安全与合规使用，我们需要进行简单的身份确认。\n\n"
-        "👉 请点击下方按钮开始流程。"
+        "👋 **欢迎使用文件下载机器人**\n\n"
+        "📌 **使用方法：**\n"
+        "直接发送 Telegram 消息链接，机器人会自动帮你下载并发送文件。\n\n"
+        "支持格式：\n"
+        "• `https://t.me/频道名/消息ID`\n"
+        "• `https://t.me/c/频道ID/消息ID`\n\n"
+        "👉 请先点击下方按钮阅读并同意用户协议。"
     )
     await message.reply_text(
         welcome_text,
@@ -561,8 +564,8 @@ async def download_dest_callback(client: Client, callback: CallbackQuery):
     await callback.message.edit_text(
         f"📥 **批量下载**\n\n"
         f"✅ 已选择目的地：{dest_name}\n\n"
-        f"⚡ 快速合集不会下载/加密，速度快；若源消息受保护导致复制失败，会在任务里标记失败。\n"
-        f"🔐 加密合集会下载、加密、上传，更安全但更慢。\n\n"
+        f"⚡ 快速合集：直接把文件发给你，不存储到频道。遇到禁止转发会自动下载后发给你。\n"
+        f"🔐 加密合集：下载后加密存到存储频道，可用提取码随时取回。\n\n"
         f"**第二步：输入来源**\n"
         f"最简单：复制目标视频的消息链接直接发给我。\n"
         f"消息 ID 就是链接最后一段数字。\n\n"
@@ -1079,81 +1082,21 @@ async def do_batch_download(client, message, chat_id, limit, dest="collection", 
             except: pass
 
             if dest == "fast_collection":
-                # 先尝试快速复制（copy_message），失败则降级为下载→上传
-                copied_msg = None
-                fast_copy_failed = False
+                # ⚡ 快速模式：直接下载后发给用户，不存储到频道
+                # 先尝试 copy_message 直接发给用户（无需下载，速度最快）
+                send_ok = False
+                copy_hint = ""
                 try:
-                    copied_msg = await user.copy_message(
-                        chat_id=target_chat_id,
+                    await user.copy_message(
+                        chat_id=message.chat.id,
                         from_chat_id=chat_id,
                         message_id=target_msg.id,
                     )
+                    send_ok = True
                 except Exception as copy_err:
-                    # 受保护内容/禁止转发 -> 降级为下载→上传
-                    fast_copy_failed = True
                     copy_hint = _download_error_hint(copy_err)
 
-                if copied_msg is not None:
-                    # 快速复制成功
-                    copied_media = _message_media_info(copied_msg)
-                    if not copied_media:
-                        fail_count += 1
-                        fail_reasons.append(f"#{target_msg.id}: 快速复制后未返回媒体")
-                        db.update_download_task(
-                            task_key,
-                            success_count=success_count,
-                            fail_count=fail_count,
-                            last_message_id=getattr(target_msg, "id", None),
-                            error_summary="\n".join(fail_reasons[-3:]),
-                        )
-                        continue
-
-                    copied_file_name, copied_file_size, copied_mime_type = copied_media
-                    copied_file_id = None
-                    copied_unique_id = None
-                    if copied_msg.video:
-                        copied_file_id = copied_msg.video.file_id
-                        copied_unique_id = copied_msg.video.file_unique_id
-                    elif copied_msg.document:
-                        copied_file_id = copied_msg.document.file_id
-                        copied_unique_id = copied_msg.document.file_unique_id
-                    elif copied_msg.photo:
-                        copied_file_id = copied_msg.photo.file_id
-                        copied_unique_id = copied_msg.photo.file_unique_id
-                    elif copied_msg.audio:
-                        copied_file_id = copied_msg.audio.file_id
-                        copied_unique_id = copied_msg.audio.file_unique_id
-
-                    if not copied_file_id or not copied_unique_id:
-                        fail_count += 1
-                        fail_reasons.append(f"#{target_msg.id}: 快速复制后缺少 file_id")
-                        db.update_download_task(
-                            task_key,
-                            success_count=success_count,
-                            fail_count=fail_count,
-                            last_message_id=getattr(target_msg, "id", None),
-                            error_summary="\n".join(fail_reasons[-3:]),
-                        )
-                        continue
-
-                    key_length = secrets.randbelow(17) + 16
-                    access_key = ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(key_length))
-                    new_file_id = db.add_file(
-                        message_id=copied_msg.id,
-                        chat_id=target_chat_id,
-                        file_id=copied_file_id,
-                        file_unique_id=copied_unique_id,
-                        file_name=copied_file_name or file_name,
-                        caption=_message_content_preview(target_msg),
-                        file_size=copied_file_size or file_size,
-                        mime_type=copied_mime_type or mime_type,
-                        storage_mode='telegram_fast',
-                        access_key=access_key,
-                        is_encrypted=False,
-                        encryption_key=None,
-                    )
-                    db.add_file_to_collection(default_collection["id"], new_file_id)
-                    success_keys.append((copied_file_name or file_name, access_key))
+                if send_ok:
                     success_count += 1
                     db.update_download_task(
                         task_key,
@@ -1164,13 +1107,12 @@ async def do_batch_download(client, message, chat_id, limit, dest="collection", 
                     )
                     continue
 
-                # ---- 降级：下载 → 上传（处理受保护/禁止转发内容）----
-                # fast_copy_failed == True，走下载上传流程
+                # copy 失败（禁止转发）→ 下载后直接发给用户
                 try:
                     await dashboard_msg.edit_text(
                         f"🚀 **批量下载任务**\n"
-                        f"📦 目标: `{dest_name}`\n"
-                        f"⬇️ 受保护内容，降级下载: `{file_name}`\n"
+                        f"📦 目标: 直接发给你\n"
+                        f"⬇️ 受保护内容，正在下载: `{file_name}`\n"
                         f"📊 进度: {current_idx}/{total_count} | ✅ {success_count} | ❌ {fail_count}",
                         reply_markup=InlineKeyboardMarkup([
                             [InlineKeyboardButton("🛑 停止任务", callback_data=f"dlstop_{user_id}")]
@@ -1188,7 +1130,7 @@ async def do_batch_download(client, message, chat_id, limit, dest="collection", 
                 if not dl_path or not os.path.exists(dl_path) or os.path.getsize(dl_path) < 1:
                     fail_count += 1
                     actual_size = os.path.getsize(dl_path) if dl_path and os.path.exists(dl_path) else 0
-                    fail_reasons.append(f"#{target_msg.id}: 降级下载失败 ({actual_size}B)，原因: {copy_hint}")
+                    fail_reasons.append(f"#{target_msg.id}: 下载失败 ({actual_size}B)，原因: {copy_hint}")
                     try:
                         if dl_path and os.path.exists(dl_path):
                             os.remove(dl_path)
@@ -1202,105 +1144,42 @@ async def do_batch_download(client, message, chat_id, limit, dest="collection", 
                     )
                     continue
 
-                # 上传到存储频道（不加密，保持快速）
-                upload_caption = _message_content_preview(target_msg) or file_name
+                # 直接发给用户
+                send_caption = _message_content_preview(target_msg) or ""
                 try:
-                    uploaded_msg = await client.send_document(
-                        target_chat_id,
+                    await client.send_document(
+                        message.chat.id,
                         dl_path,
-                        caption=upload_caption,
+                        caption=send_caption,
                         force_document=False,
                         file_name=file_name,
                     )
-                except Exception as up_err:
+                    send_ok = True
+                except Exception as send_err:
                     fail_count += 1
-                    fail_reasons.append(f"#{target_msg.id}: 降级上传失败: {_download_error_hint(up_err)}")
+                    fail_reasons.append(f"#{target_msg.id}: 发送失败: {_download_error_hint(send_err)}")
+                    db.update_download_task(
+                        task_key,
+                        success_count=success_count,
+                        fail_count=fail_count,
+                        last_message_id=getattr(target_msg, "id", None),
+                        error_summary="\n".join(fail_reasons[-3:]),
+                    )
+                finally:
                     try:
-                        if os.path.exists(dl_path):
+                        if dl_path and os.path.exists(dl_path):
                             os.remove(dl_path)
                     except: pass
+
+                if send_ok:
+                    success_count += 1
                     db.update_download_task(
                         task_key,
+                        status="running",
                         success_count=success_count,
                         fail_count=fail_count,
                         last_message_id=getattr(target_msg, "id", None),
-                        error_summary="\n".join(fail_reasons[-3:]),
                     )
-                    continue
-
-                try:
-                    if os.path.exists(dl_path):
-                        os.remove(dl_path)
-                except: pass
-
-                # 获取上传后的 file_id
-                up_media = _message_media_info(uploaded_msg)
-                if not up_media:
-                    fail_count += 1
-                    fail_reasons.append(f"#{target_msg.id}: 降级上传后未返回媒体")
-                    db.update_download_task(
-                        task_key,
-                        success_count=success_count,
-                        fail_count=fail_count,
-                        last_message_id=getattr(target_msg, "id", None),
-                        error_summary="\n".join(fail_reasons[-3:]),
-                    )
-                    continue
-
-                up_file_name, up_file_size, up_mime_type = up_media
-                up_file_id = None
-                up_unique_id = None
-                if uploaded_msg.video:
-                    up_file_id = uploaded_msg.video.file_id
-                    up_unique_id = uploaded_msg.video.file_unique_id
-                elif uploaded_msg.document:
-                    up_file_id = uploaded_msg.document.file_id
-                    up_unique_id = uploaded_msg.document.file_unique_id
-                elif uploaded_msg.photo:
-                    up_file_id = uploaded_msg.photo.file_id
-                    up_unique_id = uploaded_msg.photo.file_unique_id
-                elif uploaded_msg.audio:
-                    up_file_id = uploaded_msg.audio.file_id
-                    up_unique_id = uploaded_msg.audio.file_unique_id
-
-                if not up_file_id:
-                    fail_count += 1
-                    fail_reasons.append(f"#{target_msg.id}: 降级上传后缺少 file_id")
-                    db.update_download_task(
-                        task_key,
-                        success_count=success_count,
-                        fail_count=fail_count,
-                        last_message_id=getattr(target_msg, "id", None),
-                        error_summary="\n".join(fail_reasons[-3:]),
-                    )
-                    continue
-
-                key_length = secrets.randbelow(17) + 16
-                access_key = ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(key_length))
-                new_file_id = db.add_file(
-                    message_id=uploaded_msg.id,
-                    chat_id=target_chat_id,
-                    file_id=up_file_id,
-                    file_unique_id=up_unique_id,
-                    file_name=file_name,
-                    caption=upload_caption,
-                    file_size=up_file_size or file_size,
-                    mime_type=up_mime_type or mime_type,
-                    storage_mode='telegram_fast',
-                    access_key=access_key,
-                    is_encrypted=False,
-                    encryption_key=None,
-                )
-                db.add_file_to_collection(default_collection["id"], new_file_id)
-                success_keys.append((file_name, access_key))
-                success_count += 1
-                db.update_download_task(
-                    task_key,
-                    status="running",
-                    success_count=success_count,
-                    fail_count=fail_count,
-                    last_message_id=getattr(target_msg, "id", None),
-                )
                 continue
 
             # 1. Download
