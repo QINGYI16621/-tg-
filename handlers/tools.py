@@ -1058,6 +1058,16 @@ async def request_download_confirmation(client, message, chat_id, limit, dest="c
         if start_message_id
         else f"扫描最近媒体：最多下载 `{limit}` 个媒体"
     )
+    source_name = "未知"
+    source_type = "未知"
+    source_error = ""
+    try:
+        chat = await client.user_client.get_chat(chat_id)
+        source_name = chat.title or chat.first_name or chat.username or str(chat.id)
+        source_type = str(chat.type).replace("ChatType.", "")
+    except Exception as e:
+        source_error = f"\n⚠️ 名称解析失败: `{_short_text(str(e), 80)}`"
+
     job_id = secrets.token_urlsafe(6).replace("_", "").replace("-", "")[:8]
     pending_download_jobs[job_id] = {
         "user_id": message.from_user.id,
@@ -1073,11 +1083,14 @@ async def request_download_confirmation(client, message, chat_id, limit, dest="c
     )
     await message.reply_text(
         "⚠️ **请确认下载任务**\n\n"
+        f"来源名称: **{_short_text(source_name, 48)}**\n"
+        f"来源类型: `{source_type}`\n"
         f"来源 ID: `{chat_id}`\n"
         f"模式: {mode_text}\n"
         f"目的地: {_download_dest_name(dest)}\n\n"
         f"{second_number_tip}"
-        "确认无误后再开始，避免输错 ID 后批量下载大量文件。",
+        "确认无误后再开始，避免输错 ID 后批量下载大量文件。"
+        f"{source_error}",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ 确认开始", callback_data=f"dlok_{job_id}")],
             [InlineKeyboardButton("❌ 取消", callback_data=f"dlno_{job_id}")]
