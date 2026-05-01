@@ -2118,6 +2118,21 @@ async def show_collection_page(client, message, collection, files, page=1, is_ca
     text = f"📁 **{collection['name']}**\n"
     text += f"📊 共 {total_files} 个文件 (第 {page}/{total_pages} 页)\n"
     text += f"-------------------------\n"
+    for item in page_files:
+        item_name = _short_text(item.get('file_name') or '未命名文件', 42)
+        item_mime = (item.get('mime_type') or '').lower()
+        if item_mime.startswith('video'):
+            item_type = '视频'
+        elif item_mime.startswith('image'):
+            item_type = '图片'
+        elif item_mime.startswith('audio'):
+            item_type = '音频'
+        elif item.get('is_encrypted'):
+            item_type = '加密文件'
+        else:
+            item_type = '文件'
+        text += f"• `{item_name}`\n"
+        text += f"  └ {item_type} | {human_size(item.get('file_size') or 0)}\n"
     text += f"🔑 提取码: `{collection['access_key']}`"
 
     # 2. 构建按钮 (使用 Smart Pagination)
