@@ -930,6 +930,131 @@ async def request_download_confirmation(client, message, chat_id, limit, dest="c
         ])
     )
 
+async def _archive_fast_collection_item(
+    client,
+    user,
+    source_chat_id,
+    target_msg,
+    file_name,
+    file_size,
+    mime_type,
+    send_caption,
+    default_collection,
+    task_key,
+    current_success,
+    current_fail,
+):
+    from handlers.transfer import config, db, os
+
+    temp_dir = config.TEMP_DOWNLOAD_DIR
+    if not os.path.exists(temp_dir):
+        os.makedirs(temp_dir, exist_ok=True)
+
+    safe_name = _safe_download_name(file_name, f"media_{target_msg.id}")
+    dl_path = await user.download_media(target_msg, file_name=os.path.join(temp_dir, safe_name))
+    if not dl_path or not os.path.exists(dl_path) or os.path.getsize(dl_path) < 1:
+        actual_size = os.path.getsize(dl_path) if dl_path and os.path.exists(dl_path) else 0
+        try:
+            if dl_path and os.path.exists(dl_path):
+                os.remove(dl_path)
+        except Exception:
+            pass
+        return {
+            "success": 0,
+            "fail": 1,
+            "reason": f"#{target_msg.id}: 下载失败 ({actual_size}B)",
+        }
+
+    try:
+        storage_uploader = client.storage_client if hasattr(client, "storage_client") else client
+        if target_msg.video:
+            storage_msg = await storage_uploader.send_video(
+                config.STORAGE_CHANNEL_ID,
+                dl_path,
+                caption=send_caption[:1024] if send_caption else None,
+                supports_streaming=True,
+                file_name=file_name,
+            )
+            media_obj = storage_msg.video
+        elif target_msg.photo:
+            storage_msg = await storage_uploader.send_photo(
+                config.STORAGE_CHANNEL_ID,
+                dl_path,
+                caption=send_caption[:1024] if send_caption else None,
+            )
+            media_obj = storage_msg.photo
+        elif target_msg.audio:
+            storage_msg = await storage_uploader.send_audio(
+                config.STORAGE_CHANNEL_ID,
+                dl_path,
+                caption=send_caption[:1024] if send_caption else None,
+                file_name=file_name,
+            )
+            media_obj = storage_msg.audio
+        elif target_msg.voice:
+            storage_msg = await storage_uploader.send_voice(
+                config.STORAGE_CHANNEL_ID,
+                dl_path,
+            )
+            media_obj = storage_msg.voice
+        else:
+            storage_msg = await storage_uploader.send_document(
+                config.STORAGE_CHANNEL_ID,
+                dl_path,
+                caption=send_caption[:1024] if send_caption else None,
+                force_document=True,
+                file_name=file_name,
+            )
+            media_obj = storage_msg.document
+
+        access_key = _generate_collection_key()
+        new_file_id = db.add_file(
+            message_id=storage_msg.id,
+            chat_id=config.STORAGE_CHANNEL_ID,
+            file_id=getattr(media_obj, "file_id", None),
+            file_unique_id=getattr(media_obj, "file_unique_id", None),
+            file_name=file_name,
+            caption=send_caption[:1024],
+            file_size=file_size,
+            mime_type=mime_type,
+            local_path=None,
+            storage_mode="telegram_fast",
+            access_key=access_key,
+            is_encrypted=False,
+            encryption_key=None,
+            backup_message_id=0,
+            backup_chat_id=0,
+        )
+        if new_file_id:
+            db.add_file_to_collection(default_collection["id"], new_file_id)
+        db.update_download_task(
+            task_key,
+            status="running",
+            success_count=current_success + 1,
+            fail_count=current_fail,
+            last_message_id=getattr(target_msg, "id", None),
+        )
+        return {"success": 1, "fail": 0, "reason": None}
+    except Exception as exc:
+        db.update_download_task(
+            task_key,
+            success_count=current_success,
+            fail_count=current_fail + 1,
+            last_message_id=getattr(target_msg, "id", None),
+            error_summary=_download_error_hint(exc),
+        )
+        return {
+            "success": 0,
+            "fail": 1,
+            "reason": f"#{target_msg.id}: 归档失败 {_download_error_hint(exc)}",
+        }
+    finally:
+        try:
+            if dl_path and os.path.exists(dl_path):
+                os.remove(dl_path)
+        except Exception:
+            pass
+
 async def do_batch_download(client, message, chat_id, limit, dest="collection", start_message_id=None, source_name=None, task_key=None):
     """Core download logic."""
     # Use User Client (Admin's account) for downloading
@@ -1307,6 +1432,27 @@ async def do_batch_download(client, message, chat_id, limit, dest="collection", 
 
             if dest == "fast_collection":
                 # ⚡ 快速模式：直接下载后发给用户，不存储到频道
+                send_caption = _message_content_preview(target_msg) or ""
+                archive_result = await _archive_fast_collection_item(
+                    client=client,
+                    user=user,
+                    source_chat_id=chat_id,
+                    target_msg=target_msg,
+                    file_name=file_name,
+                    file_size=file_size,
+                    mime_type=mime_type,
+                    send_caption=send_caption,
+                    default_collection=default_collection,
+                    task_key=task_key,
+                    current_success=success_count,
+                    current_fail=fail_count,
+                )
+                success_count += archive_result["success"]
+                fail_count += archive_result["fail"]
+                if archive_result["reason"]:
+                    fail_reasons.append(archive_result["reason"])
+                continue
+
                 send_ok = False
                 copy_hint = ""
                 send_caption = _message_content_preview(target_msg) or ""
@@ -1658,6 +1804,7 @@ async def do_batch_download(client, message, chat_id, limit, dest="collection", 
             if collection:
                 files = db.get_collection_files(collection["id"])
                 if files:
+                    await send_collection_files(client, message, files, collection['name'])
                     await show_collection_page(client, message, collection, files, 1, send_new=True)
         except Exception as show_err:
             print(f"Fast collection summary show failed: {show_err}")
@@ -2002,6 +2149,16 @@ async def send_collection_files(client: Client, message: Message, files: list, c
                     batch_temp_paths.append(dec_path)
                 except: continue
                     
+            elif f.get('storage_mode') == 'telegram_fast':
+                msg = await storage_client.get_messages(f["chat_id"], f["message_id"])
+                if not msg or msg.empty:
+                    continue
+                dl_path = await storage_client.download_media(
+                    msg,
+                    file_name=os.path.join(temp_dir, f"fast_{f['id']}")
+                )
+                local_path = dl_path
+                batch_temp_paths.append(local_path)
             else:
                 await send_and_cleanup_batch()
                 try:
