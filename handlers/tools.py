@@ -965,13 +965,9 @@ async def do_batch_download(client, message, chat_id, limit, dest="collection", 
         dest_name = f"📂 合集：{default_collection['name']}"
         send_client = client
     elif dest == "fast_collection":
-        default_collection = create_download_task_collection(message.from_user.id, source_name)
-        if not default_collection:
-            await message.reply_text("❌ 无法创建本次快速合集，请稍后重试。")
-            return
-
         target_chat_id = config.STORAGE_CHANNEL_ID
-        dest_name = f"⚡ 快速合集：{default_collection['name']}"
+        display_name = _short_text(source_name, 36)
+        dest_name = f"⚡ 快速合集：{display_name}"
         send_client = user
     else:
         target_chat_id = config.STORAGE_CHANNEL_ID
