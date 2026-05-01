@@ -965,9 +965,13 @@ async def do_batch_download(client, message, chat_id, limit, dest="collection", 
         dest_name = f"📂 合集：{default_collection['name']}"
         send_client = client
     elif dest == "fast_collection":
+        default_collection = create_download_task_collection(message.from_user.id, source_name)
+        if not default_collection:
+            await message.reply_text("❌ 无法创建本次快速合集，请稍后重试。")
+            return
+
         target_chat_id = config.STORAGE_CHANNEL_ID
-        display_name = _short_text(source_name, 36)
-        dest_name = f"⚡ 快速合集：{display_name}"
+        dest_name = f"⚡ 快速合集：{default_collection['name']}"
         send_client = user
     else:
         target_chat_id = config.STORAGE_CHANNEL_ID
@@ -1143,6 +1147,48 @@ async def do_batch_download(client, message, chat_id, limit, dest="collection", 
     total_count = len(messages_to_process)
     pending_fast_album = []
 
+    def _get_fast_media_payload(target_msg, fallback_name, fallback_size, fallback_mime, caption_text):
+        media = target_msg.video or target_msg.photo or target_msg.document or target_msg.audio or target_msg.voice
+        if not media:
+            return None
+        return {
+            "message_id": getattr(target_msg, "id", None),
+            "chat_id": chat_id,
+            "file_id": getattr(media, "file_id", None),
+            "file_unique_id": getattr(media, "file_unique_id", None),
+            "file_name": fallback_name,
+            "caption": caption_text or "",
+            "file_size": fallback_size,
+            "mime_type": fallback_mime,
+        }
+
+    def _store_fast_collection_item(item):
+        if dest != "fast_collection" or not default_collection:
+            return
+        try:
+            access_key = _generate_collection_key()
+            new_file_id = db.add_file(
+                message_id=item["message_id"],
+                chat_id=item["chat_id"],
+                file_id=item["file_id"],
+                file_unique_id=item["file_unique_id"],
+                file_name=item["file_name"],
+                caption=item["caption"],
+                file_size=item["file_size"],
+                mime_type=item["mime_type"],
+                local_path=None,
+                storage_mode="telegram_fast",
+                access_key=access_key,
+                is_encrypted=False,
+                encryption_key=None,
+                backup_message_id=0,
+                backup_chat_id=0,
+            )
+            if new_file_id:
+                db.add_file_to_collection(default_collection["id"], new_file_id)
+        except Exception as store_err:
+            print(f"Fast collection store failed: {store_err}")
+
     async def flush_fast_album():
         nonlocal pending_fast_album, success_count, fail_count
         if not pending_fast_album:
@@ -1171,6 +1217,8 @@ async def do_batch_download(client, message, chat_id, limit, dest="collection", 
 
             success_count += len(pending_fast_album)
             last_item = pending_fast_album[-1]
+            for item in pending_fast_album:
+                _store_fast_collection_item(item)
             db.update_download_task(
                 task_key,
                 status="running",
@@ -1196,6 +1244,7 @@ async def do_batch_download(client, message, chat_id, limit, dest="collection", 
                             caption=item["caption"] or None,
                         )
                     success_count += 1
+                    _store_fast_collection_item(item)
                     db.update_download_task(
                         task_key,
                         status="running",
@@ -1275,6 +1324,11 @@ async def do_batch_download(client, message, chat_id, limit, dest="collection", 
                                 "caption": send_caption[:1024],
                                 "file_name": file_name,
                                 "message_id": getattr(target_msg, "id", None),
+                                "chat_id": chat_id,
+                                "file_id": getattr(target_msg.video, "file_id", None),
+                                "file_unique_id": getattr(target_msg.video, "file_unique_id", None),
+                                "file_size": file_size,
+                                "mime_type": mime_type,
                             })
                         else:
                             pending_fast_album.append({
@@ -1287,6 +1341,11 @@ async def do_batch_download(client, message, chat_id, limit, dest="collection", 
                                 "caption": send_caption[:1024],
                                 "file_name": file_name,
                                 "message_id": getattr(target_msg, "id", None),
+                                "chat_id": chat_id,
+                                "file_id": getattr(target_msg.photo, "file_id", None),
+                                "file_unique_id": getattr(target_msg.photo, "file_unique_id", None),
+                                "file_size": file_size,
+                                "mime_type": mime_type,
                             })
                         if len(pending_fast_album) >= 10:
                             await flush_fast_album()
@@ -1346,6 +1405,11 @@ async def do_batch_download(client, message, chat_id, limit, dest="collection", 
                                 "caption": send_caption[:1024],
                                 "file_name": file_name,
                                 "message_id": getattr(target_msg, "id", None),
+                                "chat_id": chat_id,
+                                "file_id": getattr(target_msg.video, "file_id", None),
+                                "file_unique_id": getattr(target_msg.video, "file_unique_id", None),
+                                "file_size": file_size,
+                                "mime_type": mime_type,
                                 "temp_path": dl_path,
                             })
                         else:
@@ -1359,6 +1423,11 @@ async def do_batch_download(client, message, chat_id, limit, dest="collection", 
                                 "caption": send_caption[:1024],
                                 "file_name": file_name,
                                 "message_id": getattr(target_msg, "id", None),
+                                "chat_id": chat_id,
+                                "file_id": getattr(target_msg.photo, "file_id", None),
+                                "file_unique_id": getattr(target_msg.photo, "file_unique_id", None),
+                                "file_size": file_size,
+                                "mime_type": mime_type,
                                 "temp_path": dl_path,
                             })
                         if len(pending_fast_album) >= 10:
@@ -1372,11 +1441,17 @@ async def do_batch_download(client, message, chat_id, limit, dest="collection", 
                             caption=send_caption[:1024] if send_caption else None,
                             file_name=file_name,
                         )
+                        _store_fast_collection_item(
+                            _get_fast_media_payload(target_msg, file_name, file_size, mime_type, send_caption[:1024])
+                        )
                     elif target_msg.voice:
                         await flush_fast_album()
                         await client.send_voice(
                             message.chat.id,
                             dl_path,
+                        )
+                        _store_fast_collection_item(
+                            _get_fast_media_payload(target_msg, file_name, file_size, mime_type, send_caption[:1024])
                         )
                     else:
                         # 其他类型仍按文件发送
@@ -1387,6 +1462,9 @@ async def do_batch_download(client, message, chat_id, limit, dest="collection", 
                             caption=send_caption[:1024] if send_caption else None,
                             force_document=True,
                             file_name=file_name,
+                        )
+                        _store_fast_collection_item(
+                            _get_fast_media_payload(target_msg, file_name, file_size, mime_type, send_caption[:1024])
                         )
                     send_ok = True
                 except Exception as send_err:
@@ -1570,8 +1648,13 @@ async def do_batch_download(client, message, chat_id, limit, dest="collection", 
             f"你之后直接把这个密钥发给机器人，就能提取本次下载归档。"
         )
     elif dest == "fast_collection":
-        # 快速合集：文件已直接发给你，无需密钥
-        access_tip = f"\n\n✅ 文件已直接发送给你，无需提取码。"
+        # 快速合集：文件已直接发送给你，同时归档到合集
+        access_tip = (
+            f"\n\n✅ 文件已直接发送给你，并已归档到合集。\n"
+            f"🔑 **合集密钥**\n"
+            f"`{default_collection['access_key']}`\n"
+            f"之后把这个密钥发给机器人，就能再次取回本次文件。"
+        )
     elif dest == "channel" and success_keys:
         shown = "\n".join(
             f"- `{key}` | {_short_text(name, 24)}"
@@ -1599,8 +1682,10 @@ async def do_batch_download(client, message, chat_id, limit, dest="collection", 
             f"把这个密钥发给机器人即可提取。"
         )
     elif dest == "fast_collection":
-        # 快速合集：文件已直接发给你，无需密钥
-        collection_tip = f"\n✅ 文件已直接发送给你，无需提取码。"
+        collection_tip = (
+            f"\n✅ 文件已直接发送给你，并归档到合集。"
+            f"\n🔑 合集密钥: `{default_collection['access_key']}`"
+        )
     elif dest == "channel" and success_keys:
         first_name, first_key = success_keys[0]
         collection_tip = f"\n🔑 首个文件提取码: `{first_key}`"
