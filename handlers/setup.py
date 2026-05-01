@@ -177,8 +177,70 @@ async def channel_id_sniffer(client: Client, message: Message):
     & ~filters.command("addto") & ~filters.command("mycollections")
     & ~filters.command("tasks") & ~filters.command("security")
 )
+async def admin_smart_direct_handler(client: Client, message: Message):
+    """Allow admin to paste download sources directly without entering the menu."""
+    if not await check_auth(client, message):
+        return
+
+    if message.from_user.id != client.admin_id:
+        return
+
+    import re
+    clean_text = re.sub(r'^@\w+\s+', '', message.text.strip()).strip()
+
+    from handlers.tools import (
+        _parse_download_source,
+        request_download_confirmation,
+        user_collecting_mode,
+        user_interaction_state,
+        user_pending_newcol,
+    )
+
+    in_manual_flow = (
+        message.reply_to_message is not None
+        or message.from_user.id in user_interaction_state
+        or message.from_user.id in user_collecting_mode
+        or message.from_user.id in user_pending_newcol
+        or clean_text.startswith("/")
+    )
+    if in_manual_flow:
+        return
+
+    looks_like_download_source = (
+        "t.me/" in clean_text
+        or re.match(r"^-?\d+\s+\d+(?:\s+\d+)?$", clean_text) is not None
+    )
+    if not looks_like_download_source:
+        return
+
+    try:
+        chat_id, start_message_id, limit = await _parse_download_source(client, clean_text)
+    except Exception:
+        return
+
+    await request_download_confirmation(
+        client,
+        message,
+        chat_id,
+        limit,
+        "fast_collection",
+        start_message_id=start_message_id,
+    )
+    message.stop_propagation()
+
+
+@Client.on_message(
+    filters.text & filters.private
+    & ~filters.reply
+    & ~filters.command("start") & ~filters.command("recent")
+    & ~filters.command("download") & ~filters.command("search")
+    & ~filters.command("getid") & ~filters.command("linked")
+    & ~filters.command("deleted") & ~filters.command("newcollection")
+    & ~filters.command("addto") & ~filters.command("mycollections")
+    & ~filters.command("tasks") & ~filters.command("security")
+)
 async def link_handler(client: Client, message: Message):
-    """Handle extraction keys and collection keys. TG links are handled by transfer.py."""
+    """Handle extraction keys, collection keys, and admin smart direct input."""
     # 权限检查
     if not await check_auth(client, message):
         return
