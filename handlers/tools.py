@@ -874,8 +874,27 @@ async def request_download_confirmation(client, message, chat_id, limit, dest="c
 
     if start_message_id:
         try:
-            preview_msg = await client.user_client.get_messages(chat_id, start_message_id)
-            preview_text = "\n\n👀 **下载前预览**\n" + _format_message_preview(preview_msg)
+            if limit > 1:
+                first_id = max(1, start_message_id - limit + 1)
+                preview_ids = list(range(start_message_id, first_id - 1, -1))
+                preview_msgs = await client.user_client.get_messages(chat_id, preview_ids)
+                if not isinstance(preview_msgs, list):
+                    preview_msgs = [preview_msgs]
+
+                preview_candidates = [
+                    msg for msg in preview_msgs
+                    if msg and not getattr(msg, "empty", False) and msg.media
+                ]
+                shown = preview_candidates[:5]
+                preview_lines = ["\n\n👀 **下载前预览**"]
+                for idx, msg in enumerate(shown, start=1):
+                    preview_lines.append(f"\n**第 {idx} 条**\n{_format_message_preview(msg)}")
+                if len(preview_candidates) > len(shown):
+                    preview_lines.append(f"\n... 还有 `{len(preview_candidates) - len(shown)}` 条未显示")
+                preview_text = "\n".join(preview_lines)
+            else:
+                preview_msg = await client.user_client.get_messages(chat_id, start_message_id)
+                preview_text = "\n\n👀 **下载前预览**\n" + _format_message_preview(preview_msg)
         except Exception as e:
             preview_text = f"\n\n👀 **下载前预览**\n预览失败: `{_download_error_hint(e)}`"
 
@@ -1119,12 +1138,94 @@ async def do_batch_download(client, message, chat_id, limit, dest="collection", 
     import string
     import base64
     from services.crypto_utils import generate_key, encrypt_file
+    from pyrogram.types import InputMediaPhoto, InputMediaVideo
     
     success_count = 0
     fail_count = 0
     fail_reasons = []
     success_keys = []
     total_count = len(messages_to_process)
+    pending_fast_album = []
+
+    async def flush_fast_album():
+        nonlocal pending_fast_album, success_count, fail_count
+        if not pending_fast_album:
+            return
+
+        media = [item["media"] for item in pending_fast_album]
+        try:
+            if len(media) == 1:
+                item = pending_fast_album[0]
+                if item["kind"] == "video":
+                    await user.send_video(
+                        message.chat.id,
+                        item["payload"],
+                        caption=item["caption"] or None,
+                        supports_streaming=True,
+                        file_name=item["file_name"],
+                    )
+                else:
+                    await user.send_photo(
+                        message.chat.id,
+                        item["payload"],
+                        caption=item["caption"] or None,
+                    )
+            else:
+                await user.send_media_group(message.chat.id, media)
+
+            success_count += len(pending_fast_album)
+            last_item = pending_fast_album[-1]
+            db.update_download_task(
+                task_key,
+                status="running",
+                success_count=success_count,
+                fail_count=fail_count,
+                last_message_id=last_item["message_id"],
+            )
+        except Exception as batch_err:
+            for item in pending_fast_album:
+                try:
+                    if item["kind"] == "video":
+                        await user.send_video(
+                            message.chat.id,
+                            item["payload"],
+                            caption=item["caption"] or None,
+                            supports_streaming=True,
+                            file_name=item["file_name"],
+                        )
+                    else:
+                        await user.send_photo(
+                            message.chat.id,
+                            item["payload"],
+                            caption=item["caption"] or None,
+                        )
+                    success_count += 1
+                    db.update_download_task(
+                        task_key,
+                        status="running",
+                        success_count=success_count,
+                        fail_count=fail_count,
+                        last_message_id=item["message_id"],
+                    )
+                except Exception as send_err:
+                    fail_count += 1
+                    fail_reasons.append(f"#{item['message_id']}: 发送失败 { _download_error_hint(send_err) }")
+                    db.update_download_task(
+                        task_key,
+                        success_count=success_count,
+                        fail_count=fail_count,
+                        last_message_id=item["message_id"],
+                        error_summary="\n".join(fail_reasons[-3:]),
+                    )
+        finally:
+            for item in pending_fast_album:
+                temp_path = item.get("temp_path")
+                if temp_path and os.path.exists(temp_path):
+                    try:
+                        os.remove(temp_path)
+                    except Exception:
+                        pass
+            pending_fast_album = []
     
     # Process from oldest to newest
     for index, target_msg in enumerate(reversed(messages_to_process)):
@@ -1161,29 +1262,43 @@ async def do_batch_download(client, message, chat_id, limit, dest="collection", 
 
             if dest == "fast_collection":
                 # ⚡ 快速模式：直接下载后发给用户，不存储到频道
-                # 先尝试 copy_message 直接发给用户（无需下载，速度最快）
                 send_ok = False
                 copy_hint = ""
-                try:
-                    await user.copy_message(
-                        chat_id=message.chat.id,
-                        from_chat_id=chat_id,
-                        message_id=target_msg.id,
-                    )
-                    send_ok = True
-                except Exception as copy_err:
-                    copy_hint = _download_error_hint(copy_err)
+                send_caption = _message_content_preview(target_msg) or ""
 
-                if send_ok:
-                    success_count += 1
-                    db.update_download_task(
-                        task_key,
-                        status="running",
-                        success_count=success_count,
-                        fail_count=fail_count,
-                        last_message_id=getattr(target_msg, "id", None),
-                    )
-                    continue
+                if target_msg.video or target_msg.photo:
+                    try:
+                        if target_msg.video:
+                            pending_fast_album.append({
+                                "kind": "video",
+                                "payload": target_msg.video.file_id,
+                                "media": InputMediaVideo(
+                                    target_msg.video.file_id,
+                                    caption=send_caption[:1024] if send_caption else None,
+                                ),
+                                "caption": send_caption[:1024],
+                                "file_name": file_name,
+                                "message_id": getattr(target_msg, "id", None),
+                            })
+                        else:
+                            pending_fast_album.append({
+                                "kind": "photo",
+                                "payload": target_msg.photo.file_id,
+                                "media": InputMediaPhoto(
+                                    target_msg.photo.file_id,
+                                    caption=send_caption[:1024] if send_caption else None,
+                                ),
+                                "caption": send_caption[:1024],
+                                "file_name": file_name,
+                                "message_id": getattr(target_msg, "id", None),
+                            })
+                        if len(pending_fast_album) >= 10:
+                            await flush_fast_album()
+                        continue
+                    except Exception as copy_err:
+                        copy_hint = _download_error_hint(copy_err)
+
+                await flush_fast_album()
 
                 # copy 失败（禁止转发）→ 下载后直接发给用户
                 try:
@@ -1222,24 +1337,39 @@ async def do_batch_download(client, message, chat_id, limit, dest="collection", 
                     )
                     continue
 
-                # 直接发给用户（按媒体类型发送，尽量保持 Telegram 原生播放形态）
-                send_caption = _message_content_preview(target_msg) or ""
                 try:
-                    if target_msg.video:
-                        await client.send_video(
-                            message.chat.id,
-                            dl_path,
-                            caption=send_caption[:1024] if send_caption else None,
-                            supports_streaming=True,
-                            file_name=file_name,
-                        )
-                    elif target_msg.photo:
-                        await client.send_photo(
-                            message.chat.id,
-                            dl_path,
-                            caption=send_caption[:1024] if send_caption else None,
-                        )
+                    if target_msg.video or target_msg.photo:
+                        if target_msg.video:
+                            pending_fast_album.append({
+                                "kind": "video",
+                                "payload": dl_path,
+                                "media": InputMediaVideo(
+                                    dl_path,
+                                    caption=send_caption[:1024] if send_caption else None,
+                                ),
+                                "caption": send_caption[:1024],
+                                "file_name": file_name,
+                                "message_id": getattr(target_msg, "id", None),
+                                "temp_path": dl_path,
+                            })
+                        else:
+                            pending_fast_album.append({
+                                "kind": "photo",
+                                "payload": dl_path,
+                                "media": InputMediaPhoto(
+                                    dl_path,
+                                    caption=send_caption[:1024] if send_caption else None,
+                                ),
+                                "caption": send_caption[:1024],
+                                "file_name": file_name,
+                                "message_id": getattr(target_msg, "id", None),
+                                "temp_path": dl_path,
+                            })
+                        if len(pending_fast_album) >= 10:
+                            await flush_fast_album()
+                        send_ok = True
                     elif target_msg.audio:
+                        await flush_fast_album()
                         await client.send_audio(
                             message.chat.id,
                             dl_path,
@@ -1247,12 +1377,14 @@ async def do_batch_download(client, message, chat_id, limit, dest="collection", 
                             file_name=file_name,
                         )
                     elif target_msg.voice:
+                        await flush_fast_album()
                         await client.send_voice(
                             message.chat.id,
                             dl_path,
                         )
                     else:
                         # 其他类型仍按文件发送
+                        await flush_fast_album()
                         await client.send_document(
                             message.chat.id,
                             dl_path,
@@ -1272,20 +1404,22 @@ async def do_batch_download(client, message, chat_id, limit, dest="collection", 
                         error_summary="\n".join(fail_reasons[-3:]),
                     )
                 finally:
-                    try:
-                        if dl_path and os.path.exists(dl_path):
-                            os.remove(dl_path)
-                    except: pass
+                    if not (target_msg.video or target_msg.photo):
+                        try:
+                            if dl_path and os.path.exists(dl_path):
+                                os.remove(dl_path)
+                        except: pass
 
                 if send_ok:
-                    success_count += 1
-                    db.update_download_task(
-                        task_key,
-                        status="running",
-                        success_count=success_count,
-                        fail_count=fail_count,
-                        last_message_id=getattr(target_msg, "id", None),
-                    )
+                    if not (target_msg.video or target_msg.photo):
+                        success_count += 1
+                        db.update_download_task(
+                            task_key,
+                            status="running",
+                            success_count=success_count,
+                            fail_count=fail_count,
+                            last_message_id=getattr(target_msg, "id", None),
+                        )
                 continue
 
             # 1. Download
@@ -1424,6 +1558,8 @@ async def do_batch_download(client, message, chat_id, limit, dest="collection", 
                 error_summary="\n".join(fail_reasons[-3:]),
             )
             print(f"Batch file error: {e}")
+
+    await flush_fast_album()
 
     reason_text = ""
     if fail_reasons:
