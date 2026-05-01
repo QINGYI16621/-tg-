@@ -2248,6 +2248,8 @@ async def send_collection_files(client: Client, message: Message, files: list, c
     优化：使用临时目录，每发送一批就立即清理，防止磁盘爆满
     """
     import config
+    import logging
+    logger = logging.getLogger(__name__)
     
     if edit_msg:
         status_msg = edit_msg
@@ -2287,6 +2289,12 @@ async def send_collection_files(client: Client, message: Message, files: list, c
         """发送当前媒体组并清理临时文件"""
         nonlocal media_group, batch_temp_paths, sent_count
         if media_group:
+            logger.warning(
+                "Collection send flush: collection=%s batch=%s temp_files=%s",
+                collection_name,
+                len(media_group),
+                len(batch_temp_paths),
+            )
             await client.send_media_group(message.chat.id, media_group)
             sent_count += len(media_group)
             media_group = []
@@ -2294,8 +2302,25 @@ async def send_collection_files(client: Client, message: Message, files: list, c
         await cleanup_batch(batch_temp_paths)
         batch_temp_paths = []
     
+    logger.warning(
+        "Collection send start: collection=%s total=%s encrypted=%s",
+        collection_name,
+        len(files),
+        any(item.get('is_encrypted') for item in files),
+    )
+
     for idx, f in enumerate(files):
         try:
+            logger.warning(
+                "Collection file begin: collection=%s index=%s/%s file_id=%s storage_mode=%s mime=%s file_name=%s",
+                collection_name,
+                idx + 1,
+                len(files),
+                f.get('id'),
+                f.get('storage_mode'),
+                f.get('mime_type'),
+                f.get('file_name'),
+            )
             local_path = None
             is_video = False
             is_image = False
@@ -2308,6 +2333,7 @@ async def send_collection_files(client: Client, message: Message, files: list, c
                 is_video = True
             
             if f.get('is_encrypted'):
+                logger.warning("Collection encrypted fetch: db_id=%s chat_id=%s message_id=%s", f.get('id'), f.get('chat_id'), f.get('message_id'))
                 enc_msg = await storage_client.get_messages(f["chat_id"], f["message_id"])
                 
                 is_valid = enc_msg and not enc_msg.empty and enc_msg.document
@@ -2325,6 +2351,7 @@ async def send_collection_files(client: Client, message: Message, files: list, c
                 try:
                     dl_path = await storage_client.download_media(enc_msg, file_name=os.path.join(temp_dir, f"enc_{f['id']}"))
                     batch_temp_paths.append(dl_path)
+                    logger.warning("Collection encrypted download ok: db_id=%s path=%s", f.get('id'), dl_path)
                 except: continue
 
                 if not dl_path: continue
@@ -2336,11 +2363,14 @@ async def send_collection_files(client: Client, message: Message, files: list, c
                     await asyncio.to_thread(decrypt_file, dl_path, dec_path, aes_key)
                     local_path = dec_path
                     batch_temp_paths.append(dec_path)
+                    logger.warning("Collection decrypt ok: db_id=%s path=%s", f.get('id'), dec_path)
                 except: continue
                     
             elif f.get('storage_mode') == 'telegram_fast':
+                logger.warning("Collection telegram_fast fetch: db_id=%s chat_id=%s message_id=%s", f.get('id'), f.get('chat_id'), f.get('message_id'))
                 msg = await storage_client.get_messages(f["chat_id"], f["message_id"])
                 if not msg or msg.empty:
+                    logger.warning("Collection telegram_fast fetch empty: db_id=%s", f.get('id'))
                     continue
                 dl_path = await storage_client.download_media(
                     msg,
@@ -2348,7 +2378,9 @@ async def send_collection_files(client: Client, message: Message, files: list, c
                 )
                 local_path = dl_path
                 batch_temp_paths.append(local_path)
+                logger.warning("Collection telegram_fast download ok: db_id=%s path=%s", f.get('id'), dl_path)
             else:
+                logger.warning("Collection direct send path: db_id=%s", f.get('id'))
                 await send_and_cleanup_batch()
                 try:
                     await client.copy_message(
@@ -2357,6 +2389,7 @@ async def send_collection_files(client: Client, message: Message, files: list, c
                         message_id=f["message_id"],
                     )
                     sent_count += 1
+                    logger.warning("Collection copy_message ok: db_id=%s", f.get('id'))
                     continue
                 except Exception:
                     try:
@@ -2366,27 +2399,33 @@ async def send_collection_files(client: Client, message: Message, files: list, c
                             caption=f.get("caption") or "",
                         )
                         sent_count += 1
+                        logger.warning("Collection send_cached_media ok: db_id=%s", f.get('id'))
                         continue
                     except Exception:
                         msg = await storage_client.get_messages(f["chat_id"], f["message_id"])
                         dl_path = await storage_client.download_media(msg, file_name=os.path.join(temp_dir, f"plain_{f['id']}"))
                         local_path = dl_path
                         batch_temp_paths.append(local_path)
+                        logger.warning("Collection plain fallback download ok: db_id=%s path=%s", f.get('id'), dl_path)
             
             if not local_path or not os.path.exists(local_path):
+                logger.warning("Collection local path missing: db_id=%s path=%s", f.get('id'), local_path)
                 continue
 
             caption = f['caption'] or ""
             
             if is_image:
                 media_group.append(InputMediaPhoto(local_path, caption=caption))
+                logger.warning("Collection append photo: db_id=%s batch_size=%s", f.get('id'), len(media_group))
             elif is_video:
                 media_group.append(InputMediaVideo(local_path, caption=caption))
+                logger.warning("Collection append video: db_id=%s batch_size=%s", f.get('id'), len(media_group))
             else:
                 # 文档：先发送当前媒体组，再单独发送文档
                 await send_and_cleanup_batch()
                 await client.send_document(message.chat.id, local_path, caption=caption, file_name=f['file_name'])
                 sent_count += 1
+                logger.warning("Collection send document ok: db_id=%s", f.get('id'))
                 # 单独清理这个文档的临时文件
                 await cleanup_batch([local_path])
 
@@ -2395,10 +2434,12 @@ async def send_collection_files(client: Client, message: Message, files: list, c
                 await send_and_cleanup_batch()
         
         except Exception as e:
+            logger.exception("Collection file failed: collection=%s db_id=%s", collection_name, f.get('id'))
             print(f"Error processing file {f.get('id')}: {e}")
     
     # 发送剩余的媒体组
     await send_and_cleanup_batch()
+    logger.warning("Collection send finished: collection=%s sent=%s", collection_name, sent_count)
         
     await status_msg.edit_text(f"✅ 合集 **{collection_name}** 发送完成！共 {sent_count} 个文件。")
     return status_msg
