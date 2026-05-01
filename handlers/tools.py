@@ -7,7 +7,6 @@ import asyncio
 import time
 import re
 import os
-import json
 import unicodedata
 from pyrogram.types import Message as PyrogramMessage
 from database import db
@@ -733,24 +732,6 @@ def _format_message_preview(msg):
         f"{content_line}"
     ).strip()
 
-def _looks_like_message_json(text):
-    text = (text or "").strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text)
-    return (
-        text.startswith("{")
-        and (
-            '"peer_id"' in text
-            or "'peer_id'" in text
-            or '"peer id"' in text
-            or "'peer id'" in text
-        )
-        and (
-            '"id"' in text
-            or "'id'" in text
-        )
-    )
-
 async def _parse_download_source(client, text):
     """
     Parse download input.
@@ -772,53 +753,6 @@ async def _parse_download_source(client, text):
         .replace("\u200c", "")
         .replace("\u200d", "")
     ).strip()
-
-    # 兼容 raw message JSON（导出/抓包格式）
-    # 支持字段:
-    # - id: 消息ID
-    # - peer_id: {_:"peerChannel"/"peerChat"/"peerUser", ...}
-    # 例:
-    # {"_":"message","id":21606,"peer_id":{"_":"peerChannel","channel_id":12345}}
-    json_text = text
-    if json_text.startswith("```"):
-        json_text = re.sub(r"^```(?:json)?\s*", "", json_text)
-        json_text = re.sub(r"\s*```$", "", json_text)
-    try:
-        decoder = json.JSONDecoder()
-        start = json_text.find("{")
-        while start != -1:
-            try:
-                obj, _ = decoder.raw_decode(json_text[start:])
-            except json.JSONDecodeError:
-                start = json_text.find("{", start + 1)
-                continue
-
-            if isinstance(obj, dict):
-                norm_obj = {re.sub(r"\s+", "", str(k)): v for k, v in obj.items()}
-            else:
-                start = json_text.find("{", start + 1)
-                continue
-
-            if norm_obj.get("_") == "message":
-                msg_id = int(norm_obj.get("id"))
-                peer = norm_obj.get("peer_id") or {}
-                peer_norm = {re.sub(r"\s+", "", str(k)): v for k, v in peer.items()} if isinstance(peer, dict) else {}
-                peer_type = str(peer_norm.get("_", "")).lower()
-                if peer_type == "peerchannel":
-                    chat_id = int(f"-100{int(peer_norm.get('channel_id'))}")
-                elif peer_type == "peerchat":
-                    chat_id = -int(peer_norm.get("chat_id"))
-                elif peer_type == "peeruser":
-                    chat_id = int(peer_norm.get("user_id"))
-                else:
-                    raise ValueError("JSON 缺少可识别的 peer_id")
-                return chat_id, msg_id, 1
-            # 可能先命中到内层对象（例如 sizes/item），继续向后寻找 message 根对象
-            start = json_text.find("{", start + 1)
-            continue
-    except Exception:
-        # JSON 解析失败时继续走原有文本/链接解析
-        pass
 
     link_match = re.search(r"(?:https?://)?t\.me/(c/)?([^/\s]+)/(\d+)", text)
     if link_match:
@@ -2824,7 +2758,6 @@ async def sub_start_download_handler(client, message):
         "精准下载：`频道ID 消息ID 数量`\n"
         "例如：`-1001234567890 4567 1`（下载消息4567起共1条）\n"
         "例如：`-1001234567890 4567 5`（下载消息4567起共5条）\n\n"
-        "也支持直接粘贴 message JSON（含 `id` 与 `peer_id` 字段）自动识别。\n\n"
         "发 `取消` 或点 **❌ 取消操作** 可退出。",
         reply_markup=get_cancel_keyboard(is_adm)
     )
@@ -2974,8 +2907,8 @@ async def download_state_handler(client, message):
         try:
             raw_text = message.text.strip()
 
-            # 兼容：直接发链接 / 完整格式 / raw message JSON，直接进入确认
-            if "t.me/" in raw_text or _looks_like_message_json(raw_text) or len(raw_text.split()) >= 2:
+            # 兼容：直接发链接 / 完整格式，直接进入确认
+            if "t.me/" in raw_text or len(raw_text.split()) >= 2:
                 chat_id, start_message_id, limit = await _parse_download_source(client, raw_text)
                 user_interaction_state.pop(uid, None)
                 user_download_chat.pop(uid, None)
@@ -3005,7 +2938,6 @@ async def download_state_handler(client, message):
                 "第一步请先输入频道ID，例如：`-1001234567890`\n"
                 "或直接发消息链接：`https://t.me/c/1234567890/4567`\n\n"
                 "也可以输入完整格式：`频道ID 消息ID 数量`\n"
-                "或直接粘贴 message JSON（含 `id` 与 `peer_id`，压缩成一行也可以）。\n\n"
                 "点 **❌ 取消操作** 可退出当前输入。",
                 reply_markup=get_cancel_keyboard(is_adm)
             )
@@ -3023,8 +2955,8 @@ async def download_state_handler(client, message):
             if not chat_id:
                 raise ValueError("missing chat")
 
-            # 允许在第二步仍然直接贴链接或 message JSON
-            if "t.me/" in text or _looks_like_message_json(text):
+            # 允许在第二步仍然直接贴链接
+            if "t.me/" in text:
                 parsed_chat_id, start_message_id, limit = await _parse_download_source(client, text)
                 chat_id = parsed_chat_id
             else:
