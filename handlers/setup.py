@@ -316,7 +316,7 @@ async def link_handler(client: Client, message: Message):
 
     # 检查是否是合集密钥
     from handlers.tools import handle_collection_key
-    if await handle_collection_key(client, message, text):
+    if await handle_collection_key(client, message, clean_text):
         return
 
     # 配置未完成提示

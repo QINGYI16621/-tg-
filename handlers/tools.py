@@ -1973,23 +1973,9 @@ async def handle_collection_key(client: Client, message: Message, key: str):
         if not files:
             await message.reply_text(f"📁 合集 **{collection['name']}** 还没有文件。")
             return True
-        
-        # 超过10个，显示分页菜单
-        # 超过10个，显示分页菜单
-        if len(files) > 10:
-            # 自动发送第一页 (Direct Send)
-            first_page_files = files[:10]
-            status_msg = await send_collection_files(client, message, first_page_files, f"{collection['name']} (第1页)")
-            
-            # 删除完成提示，减少干扰
-            try: await status_msg.delete()
-            except: pass
-            
-            # 显示浮动菜单
-            await show_collection_page(client, message, collection, files, 1, send_new=True)
-        else:
-            # <= 10个，直接发送
-            await send_collection_files(client, message, files, collection['name'])
+
+        # 统一先显示合集页，让用户确认后再发送。
+        await show_collection_page(client, message, collection, files, 1, send_new=True)
         return True
 
     # === 情景2: 是单个文件密钥 ===
