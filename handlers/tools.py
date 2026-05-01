@@ -496,12 +496,16 @@ async def handle_reply_input(client: Client, message: Message):
                 "可以直接发消息链接，例如：`https://t.me/c/1234567890/4567`\n"
                 "或输入：`频道ID 消息ID 数量`（精准模式）"
             )
+        message.stop_propagation()
+        return
     
     # 处理创建合集回复
     elif "请输入合集名称" in prompt_text:
         collection_name = message.text.strip()
         if collection_name:
             await do_create_collection(client, message, collection_name)
+            message.stop_propagation()
+            return
 
 @Client.on_message(filters.command("download") & filters.private)
 async def batch_download(client: Client, message: Message):
