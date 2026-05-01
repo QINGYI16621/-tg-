@@ -804,7 +804,11 @@ async def _parse_download_source(client, text):
     chat_id = int(parts[0])
     if len(parts) >= 3:
         return chat_id, int(parts[1]), int(parts[2])
-    return chat_id, None, int(parts[1])
+
+    second_value = int(parts[1])
+    if second_value > 100:
+        return chat_id, second_value, 1
+    return chat_id, None, second_value
 
 def _download_dest_name(dest):
     return {
@@ -2756,6 +2760,7 @@ async def sub_start_download_handler(client, message):
         "默认使用 ⚡ 快速合集：优先直接复制，速度更快。\n"
         "如果源消息禁止复制，会自动改为下载后直发给你。\n\n"
         "精准下载：`频道ID 消息ID 数量`\n"
+        "例如：`8080158525 21037`（下载消息21037这一条）\n"
         "例如：`-1001234567890 4567 1`（下载消息4567起共1条）\n"
         "例如：`-1001234567890 4567 5`（下载消息4567起共5条）\n\n"
         "发 `取消` 或点 **❌ 取消操作** 可退出。",
