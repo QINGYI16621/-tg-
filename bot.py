@@ -25,13 +25,14 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.WARNING)
 
 _LOCK_FILE_HANDLE = None
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def acquire_single_instance_lock():
     """Prevent multiple bot.py processes from sharing the same Pyrogram sessions."""
     global _LOCK_FILE_HANDLE
 
-    lock_path = os.getenv("BOT_LOCK_FILE", os.path.abspath("bot.lock"))
+    lock_path = os.getenv("BOT_LOCK_FILE", os.path.join(APP_DIR, "bot.lock"))
     _LOCK_FILE_HANDLE = open(lock_path, "a+", encoding="utf-8")
 
     try:
