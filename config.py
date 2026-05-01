@@ -52,7 +52,8 @@ DB_PASSWORD = os.getenv("DB_PASSWORD", "").strip()
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "").strip()
 
 # ======== 临时目录与存储配置 ========
-TEMP_DOWNLOAD_DIR = os.getenv("TEMP_DIR", "/tmp/telegram_vault_tmp").strip()
+_default_temp_dir = "/dev/shm/telegram_vault_tmp" if os.path.isdir("/dev/shm") else "/tmp/telegram_vault_tmp"
+TEMP_DOWNLOAD_DIR = os.getenv("TEMP_DIR", _default_temp_dir).strip()
 STORAGE_MODE = os.getenv("STORAGE_MODE", "telegram_stealth").strip()
 
 LOCAL_STORAGE_PATH = os.getenv(

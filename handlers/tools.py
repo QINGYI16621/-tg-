@@ -946,6 +946,25 @@ async def _archive_fast_collection_item(
 ):
     from handlers.transfer import config, db, os
 
+    cached_file = db.get_cached_file_for_source(source_chat_id, getattr(target_msg, "id", None))
+    if cached_file:
+        try:
+            db.add_file_to_collection(default_collection["id"], cached_file["id"])
+            db.update_download_task(
+                task_key,
+                status="running",
+                success_count=current_success + 1,
+                fail_count=current_fail,
+                last_message_id=getattr(target_msg, "id", None),
+            )
+            return {"success": 1, "fail": 0, "reason": None}
+        except Exception as cache_err:
+            return {
+                "success": 0,
+                "fail": 1,
+                "reason": f"#{target_msg.id}: 复用失败 {_download_error_hint(cache_err)}",
+            }
+
     temp_dir = config.TEMP_DOWNLOAD_DIR
     if not os.path.exists(temp_dir):
         os.makedirs(temp_dir, exist_ok=True)
@@ -1027,6 +1046,7 @@ async def _archive_fast_collection_item(
         )
         if new_file_id:
             db.add_file_to_collection(default_collection["id"], new_file_id)
+            db.cache_source_file(source_chat_id, getattr(target_msg, "id", None), new_file_id)
         db.update_download_task(
             task_key,
             status="running",

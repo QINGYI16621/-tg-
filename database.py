@@ -149,6 +149,19 @@ class Database:
                 )
                 """
             )
+            self.cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS source_cache (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_chat_id INTEGER NOT NULL,
+                    source_message_id INTEGER NOT NULL,
+                    file_db_id INTEGER NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(source_chat_id, source_message_id),
+                    FOREIGN KEY(file_db_id) REFERENCES files(id) ON DELETE CASCADE
+                )
+                """
+            )
 
             for column_name, column_type in [
                 ("local_path", "TEXT"),
@@ -172,6 +185,7 @@ class Database:
 
             self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_files_access_key ON files(access_key)")
             self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_files_file_id ON files(file_id)")
+            self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_source_cache_lookup ON source_cache(source_chat_id, source_message_id)")
             self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_collections_owner ON collections(owner_id)")
             self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_collection_files_collection ON collection_files(collection_id)")
             self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_download_tasks_owner ON download_tasks(owner_id, created_at)")
@@ -260,6 +274,32 @@ class Database:
     def get_file_name_by_access_key(self, access_key):
         file_info = self.get_file_by_key(access_key)
         return file_info["file_name"] if file_info else None
+
+    def get_cached_file_for_source(self, source_chat_id, source_message_id):
+        self.cursor.execute(
+            """
+            SELECT file_db_id
+            FROM source_cache
+            WHERE source_chat_id = ? AND source_message_id = ?
+            """,
+            (source_chat_id, source_message_id),
+        )
+        row = self.cursor.fetchone()
+        if not row:
+            return None
+        return self.get_file_by_id(row[0])
+
+    def cache_source_file(self, source_chat_id, source_message_id, file_db_id):
+        with self._transaction():
+            self.cursor.execute(
+                """
+                INSERT INTO source_cache (source_chat_id, source_message_id, file_db_id)
+                VALUES (?, ?, ?)
+                ON CONFLICT(source_chat_id, source_message_id)
+                DO UPDATE SET file_db_id = excluded.file_db_id
+                """,
+                (source_chat_id, source_message_id, file_db_id),
+            )
 
     def search_files(self, keyword, limit=50):
         self.cursor.execute(f"SELECT {FILE_COLUMNS} FROM files ORDER BY upload_date DESC")
