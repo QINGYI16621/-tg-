@@ -733,6 +733,24 @@ def _format_message_preview(msg):
         f"{content_line}"
     ).strip()
 
+def _looks_like_message_json(text):
+    text = (text or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+    return (
+        text.startswith("{")
+        and (
+            '"peer_id"' in text
+            or "'peer_id'" in text
+            or '"peer id"' in text
+            or "'peer id'" in text
+        )
+        and (
+            '"id"' in text
+            or "'id'" in text
+        )
+    )
+
 async def _parse_download_source(client, text):
     """
     Parse download input.
@@ -2956,8 +2974,8 @@ async def download_state_handler(client, message):
         try:
             raw_text = message.text.strip()
 
-            # 兼容：直接发链接 / 完整格式，直接进入确认
-            if "t.me/" in raw_text or len(raw_text.split()) >= 2:
+            # 兼容：直接发链接 / 完整格式 / raw message JSON，直接进入确认
+            if "t.me/" in raw_text or _looks_like_message_json(raw_text) or len(raw_text.split()) >= 2:
                 chat_id, start_message_id, limit = await _parse_download_source(client, raw_text)
                 user_interaction_state.pop(uid, None)
                 user_download_chat.pop(uid, None)
@@ -2987,7 +3005,7 @@ async def download_state_handler(client, message):
                 "第一步请先输入频道ID，例如：`-1001234567890`\n"
                 "或直接发消息链接：`https://t.me/c/1234567890/4567`\n\n"
                 "也可以输入完整格式：`频道ID 消息ID 数量`\n"
-                "或直接粘贴 message JSON（含 `id` 与 `peer_id`）。\n\n"
+                "或直接粘贴 message JSON（含 `id` 与 `peer_id`，压缩成一行也可以）。\n\n"
                 "点 **❌ 取消操作** 可退出当前输入。",
                 reply_markup=get_cancel_keyboard(is_adm)
             )
@@ -3005,8 +3023,8 @@ async def download_state_handler(client, message):
             if not chat_id:
                 raise ValueError("missing chat")
 
-            # 允许在第二步仍然直接贴链接
-            if "t.me/" in text:
+            # 允许在第二步仍然直接贴链接或 message JSON
+            if "t.me/" in text or _looks_like_message_json(text):
                 parsed_chat_id, start_message_id, limit = await _parse_download_source(client, text)
                 chat_id = parsed_chat_id
             else:
