@@ -2150,15 +2150,45 @@ async def send_collection_files(client: Client, message: Message, files: list, c
                 except: continue
                     
             elif f.get('storage_mode') == 'telegram_fast':
-                msg = await storage_client.get_messages(f["chat_id"], f["message_id"])
-                if not msg or msg.empty:
+                if is_image and f.get("file_id"):
+                    media_group.append(InputMediaPhoto(f["file_id"], caption=f.get('caption') or ""))
+                    if len(media_group) >= 10:
+                        await send_and_cleanup_batch()
                     continue
-                dl_path = await storage_client.download_media(
-                    msg,
-                    file_name=os.path.join(temp_dir, f"fast_{f['id']}")
-                )
-                local_path = dl_path
-                batch_temp_paths.append(local_path)
+                if is_video and f.get("file_id"):
+                    media_group.append(InputMediaVideo(f["file_id"], caption=f.get('caption') or ""))
+                    if len(media_group) >= 10:
+                        await send_and_cleanup_batch()
+                    continue
+
+                await send_and_cleanup_batch()
+                try:
+                    await client.copy_message(
+                        chat_id=message.chat.id,
+                        from_chat_id=f["chat_id"],
+                        message_id=f["message_id"],
+                    )
+                    sent_count += 1
+                    continue
+                except Exception:
+                    try:
+                        await client.send_cached_media(
+                            message.chat.id,
+                            f["file_id"],
+                            caption=f.get("caption") or "",
+                        )
+                        sent_count += 1
+                        continue
+                    except Exception:
+                        msg = await storage_client.get_messages(f["chat_id"], f["message_id"])
+                        if not msg or msg.empty:
+                            continue
+                        dl_path = await storage_client.download_media(
+                            msg,
+                            file_name=os.path.join(temp_dir, f"fast_{f['id']}")
+                        )
+                        local_path = dl_path
+                        batch_temp_paths.append(local_path)
             else:
                 await send_and_cleanup_batch()
                 try:
