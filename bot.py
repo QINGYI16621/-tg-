@@ -1,6 +1,7 @@
 import asyncio
 import os
 import logging
+import sys
 
 # Fix for "There is no current event loop" error on newer Python versions
 try:
@@ -22,6 +23,35 @@ logging.getLogger("pyrogram").setLevel(logging.ERROR)
 logging.getLogger("pyrogram.session.session").setLevel(logging.ERROR)
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.WARNING)
+
+_LOCK_FILE_HANDLE = None
+
+
+def acquire_single_instance_lock():
+    """Prevent multiple bot.py processes from sharing the same Pyrogram sessions."""
+    global _LOCK_FILE_HANDLE
+
+    lock_path = os.getenv("BOT_LOCK_FILE", os.path.abspath("bot.lock"))
+    _LOCK_FILE_HANDLE = open(lock_path, "a+", encoding="utf-8")
+
+    try:
+        import fcntl
+
+        fcntl.flock(_LOCK_FILE_HANDLE.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except ImportError:
+        print("⚠️ 当前系统不支持 fcntl，已跳过单实例锁。")
+        return
+    except BlockingIOError:
+        _LOCK_FILE_HANDLE.seek(0)
+        old_pid = _LOCK_FILE_HANDLE.read().strip() or "unknown"
+        print(f"❌ 机器人已经在运行，PID: {old_pid}")
+        print("如需重启，请先停止旧进程，或直接运行: bash restart_bot.sh")
+        sys.exit(1)
+
+    _LOCK_FILE_HANDLE.seek(0)
+    _LOCK_FILE_HANDLE.truncate()
+    _LOCK_FILE_HANDLE.write(str(os.getpid()))
+    _LOCK_FILE_HANDLE.flush()
 
 # Ensure handlers directory is a package
 if not os.path.exists("handlers/__init__.py"):
@@ -143,6 +173,7 @@ async def main():
 
 if __name__ == "__main__":
     try:
+        acquire_single_instance_lock()
         asyncio.run(main())
     except KeyboardInterrupt:
         pass

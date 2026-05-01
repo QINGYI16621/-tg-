@@ -9,4 +9,5 @@ downloads/
 __pycache__/
 *.pyc
 bot.log
+bot.lock
 temp/
