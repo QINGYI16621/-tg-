@@ -945,6 +945,10 @@ async def _archive_fast_collection_item(
     current_fail,
 ):
     from handlers.transfer import config, db, os
+    import math
+    import hashlib
+    from pyrogram import raw, types, utils
+    from pyrogram.session import Session
 
     cached_file = db.get_cached_file_for_source(source_chat_id, getattr(target_msg, "id", None))
     if cached_file:
@@ -964,6 +968,171 @@ async def _archive_fast_collection_item(
                 "fail": 1,
                 "reason": f"#{target_msg.id}: 复用失败 {_download_error_hint(cache_err)}",
             }
+
+    async def _parse_sent_message(result):
+        for update in result.updates:
+            if isinstance(update, (raw.types.UpdateNewMessage, raw.types.UpdateNewChannelMessage)):
+                return await types.Message._parse(
+                    client,
+                    update.message,
+                    {u.id: u for u in result.users},
+                    {c.id: c for c in result.chats},
+                )
+        return None
+
+    async def _stream_upload_to_storage():
+        if not (target_msg.photo or target_msg.video):
+            return None
+
+        media_kind = "video" if target_msg.video else "photo"
+        media_size = file_size or getattr(target_msg.video or target_msg.photo, "file_size", 0) or 0
+        if media_size <= 0:
+            return None
+
+        part_size = 512 * 1024
+        file_total_parts = int(math.ceil(media_size / part_size))
+        is_big = media_size > 10 * 1024 * 1024
+        file_id = client.storage_client.rnd_id() if hasattr(client, "storage_client") else client.rnd_id()
+        md5_sum = hashlib.md5() if not is_big else None
+
+        storage_uploader = client.storage_client if hasattr(client, "storage_client") else client
+        session = Session(
+            storage_uploader,
+            await storage_uploader.storage.dc_id(),
+            await storage_uploader.storage.auth_key(),
+            await storage_uploader.storage.test_mode(),
+            is_media=True
+        )
+
+        try:
+            await session.start()
+            buffer = b""
+            file_part = 0
+
+            async for chunk in user.stream_media(target_msg):
+                buffer += chunk
+                while len(buffer) >= part_size:
+                    piece = buffer[:part_size]
+                    buffer = buffer[part_size:]
+                    if is_big:
+                        await session.invoke(
+                            raw.functions.upload.SaveBigFilePart(
+                                file_id=file_id,
+                                file_part=file_part,
+                                file_total_parts=file_total_parts,
+                                bytes=piece
+                            )
+                        )
+                    else:
+                        await session.invoke(
+                            raw.functions.upload.SaveFilePart(
+                                file_id=file_id,
+                                file_part=file_part,
+                                bytes=piece
+                            )
+                        )
+                        md5_sum.update(piece)
+                    file_part += 1
+
+            if buffer:
+                if is_big:
+                    await session.invoke(
+                        raw.functions.upload.SaveBigFilePart(
+                            file_id=file_id,
+                            file_part=file_part,
+                            file_total_parts=file_total_parts,
+                            bytes=buffer
+                        )
+                    )
+                else:
+                    await session.invoke(
+                        raw.functions.upload.SaveFilePart(
+                            file_id=file_id,
+                            file_part=file_part,
+                            bytes=buffer
+                        )
+                    )
+                    md5_sum.update(buffer)
+
+            if is_big:
+                uploaded_file = raw.types.InputFileBig(
+                    id=file_id,
+                    parts=file_total_parts,
+                    name=file_name,
+                )
+            else:
+                uploaded_file = raw.types.InputFile(
+                    id=file_id,
+                    parts=file_total_parts,
+                    name=file_name,
+                    md5_checksum="".join([hex(i)[2:].zfill(2) for i in md5_sum.digest()])
+                )
+
+            if media_kind == "photo":
+                media = raw.types.InputMediaUploadedPhoto(file=uploaded_file)
+            else:
+                media = raw.types.InputMediaUploadedDocument(
+                    mime_type=mime_type or "video/mp4",
+                    file=uploaded_file,
+                    attributes=[
+                        raw.types.DocumentAttributeVideo(
+                            supports_streaming=True,
+                            duration=getattr(target_msg.video, "duration", 0) or 0,
+                            w=getattr(target_msg.video, "width", 0) or 0,
+                            h=getattr(target_msg.video, "height", 0) or 0,
+                        ),
+                        raw.types.DocumentAttributeFilename(file_name=file_name)
+                    ]
+                )
+
+            result = await storage_uploader.invoke(
+                raw.functions.messages.SendMedia(
+                    peer=await storage_uploader.resolve_peer(config.STORAGE_CHANNEL_ID),
+                    media=media,
+                    random_id=storage_uploader.rnd_id(),
+                    **await utils.parse_text_entities(storage_uploader, send_caption[:1024], None, None)
+                )
+            )
+            return await _parse_sent_message(result)
+        finally:
+            await session.stop()
+
+    if target_msg.photo or target_msg.video:
+        try:
+            streamed_msg = await _stream_upload_to_storage()
+            if streamed_msg:
+                media_obj = streamed_msg.video if target_msg.video else streamed_msg.photo
+                access_key = _generate_collection_key()
+                new_file_id = db.add_file(
+                    message_id=streamed_msg.id,
+                    chat_id=config.STORAGE_CHANNEL_ID,
+                    file_id=getattr(media_obj, "file_id", None),
+                    file_unique_id=getattr(media_obj, "file_unique_id", None),
+                    file_name=file_name,
+                    caption=send_caption[:1024],
+                    file_size=file_size,
+                    mime_type=mime_type,
+                    local_path=None,
+                    storage_mode="telegram_fast",
+                    access_key=access_key,
+                    is_encrypted=False,
+                    encryption_key=None,
+                    backup_message_id=0,
+                    backup_chat_id=0,
+                )
+                if new_file_id:
+                    db.add_file_to_collection(default_collection["id"], new_file_id)
+                    db.cache_source_file(source_chat_id, getattr(target_msg, "id", None), new_file_id)
+                db.update_download_task(
+                    task_key,
+                    status="running",
+                    success_count=current_success + 1,
+                    fail_count=current_fail,
+                    last_message_id=getattr(target_msg, "id", None),
+                )
+                return {"success": 1, "fail": 0, "reason": None}
+        except Exception:
+            pass
 
     temp_dir = config.TEMP_DOWNLOAD_DIR
     if not os.path.exists(temp_dir):
