@@ -1,7 +1,7 @@
 # 核心功能：下载、合集、文件处理
 # 注意：中间件已迁移到 middleware.py
 
-from pyrogram import Client, filters
+from pyrogram import Client, filters, StopPropagation
 from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, BotCommand, BotCommandScopeChat, BotCommandScopeAllPrivateChats, BotCommandScopeDefault, ReplyKeyboardMarkup, KeyboardButton
 import asyncio
 import time
@@ -18,6 +18,31 @@ RATE_LIMIT_DATA = {}  # {uid: [timestamp1, timestamp2, ...]}
 RATE_LIMIT_WINDOW = 60  # seconds
 RATE_LIMIT_COUNT = 30   # 30 requests per 60s
 RATE_LIMIT_BAN_DURATION = 180  # 3 minutes
+
+# ========== Private Bot Lockdown ==========
+@Client.on_message(filters.private, group=-20)
+async def admin_only_message_middleware(client: Client, message: Message):
+    if not message.from_user or message.from_user.is_bot:
+        return
+
+    if message.from_user.id == getattr(client, "admin_id", None):
+        return
+
+    await message.reply_text("🔒 私有机器人，仅管理员可用。")
+    message.stop_propagation()
+
+
+@Client.on_callback_query(group=-20)
+async def admin_only_callback_middleware(client: Client, callback: CallbackQuery):
+    if callback.from_user and callback.from_user.id == getattr(client, "admin_id", None):
+        return
+
+    await callback.answer("🔒 私有机器人，仅管理员可用。", show_alert=True)
+    try:
+        callback.stop_propagation()
+    except AttributeError:
+        raise StopPropagation
+
 
 # ========== Middleware (Global Terms Check, Priority -10) ==========
 @Client.on_message(filters.private, group=-10)
