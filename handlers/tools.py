@@ -7,6 +7,8 @@ import asyncio
 import time
 import re
 import os
+import json
+import unicodedata
 from pyrogram.types import Message as PyrogramMessage
 from database import db
 
@@ -195,6 +197,7 @@ async def terms_middleware(client: Client, message: Message):
 
 # 全局存储
 user_download_dest = {}
+user_download_chat = {}
 pending_download_jobs = {}
 cancel_download_users = set()
 user_last_action = {}  # 频率限制：记录用户上次操作时间
@@ -226,9 +229,9 @@ async def require_admin(client, event, alert=False):
         await event.reply_text("⛔ 此功能仅限管理员使用。")
     return False
 
-def get_cancel_keyboard(is_admin_user=False):
+def get_cancel_keyboard(is_admin_user=False, show_admin_shortcuts=False):
     buttons = [[KeyboardButton("❌ 取消操作"), KeyboardButton("🔙 返回主菜单")]]
-    if is_admin_user:
+    if is_admin_user and show_admin_shortcuts:
         buttons.insert(0, [KeyboardButton("📥 批量下载"), KeyboardButton("☁️ 存储/上传")])
     return ReplyKeyboardMarkup(
         buttons,
@@ -242,6 +245,7 @@ async def clear_user_state(user_id):
     user_interaction_state.pop(user_id, None)
     user_pending_file.pop(user_id, None)
     user_download_dest.pop(user_id, None)
+    user_download_chat.pop(user_id, None)
     cancel_download_users.discard(user_id)
     for job_id, job in list(pending_download_jobs.items()):
         if job.get("user_id") == user_id:
@@ -696,6 +700,17 @@ def _message_type_text(msg):
         return "音频"
     return "消息"
 
+def human_size(size):
+    if not size:
+        return "0 B"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    value = float(size)
+    unit_idx = 0
+    while value >= 1024 and unit_idx < len(units) - 1:
+        value /= 1024
+        unit_idx += 1
+    return f"{value:.2f} {units[unit_idx]}"
+
 def _format_message_preview(msg):
     if not msg or getattr(msg, "empty", False):
         return "预览: `消息为空或不可访问`"
@@ -729,13 +744,71 @@ async def _parse_download_source(client, text):
     - https://t.me/channelname/4567
     - https://t.me/channelname/4567 3
     """
-    text = text.strip()
+    text = unicodedata.normalize("NFKC", text or "")
+    text = (
+        text
+        .replace("\u00a0", " ")   # NBSP
+        .replace("\u3000", " ")   # 全角空格
+        .replace("\ufeff", "")    # BOM
+        .replace("\u200b", "")    # Zero-width space
+        .replace("\u200c", "")
+        .replace("\u200d", "")
+    ).strip()
+
+    # 兼容 raw message JSON（导出/抓包格式）
+    # 支持字段:
+    # - id: 消息ID
+    # - peer_id: {_:"peerChannel"/"peerChat"/"peerUser", ...}
+    # 例:
+    # {"_":"message","id":21606,"peer_id":{"_":"peerChannel","channel_id":12345}}
+    json_text = text
+    if json_text.startswith("```"):
+        json_text = re.sub(r"^```(?:json)?\s*", "", json_text)
+        json_text = re.sub(r"\s*```$", "", json_text)
+    try:
+        decoder = json.JSONDecoder()
+        start = json_text.find("{")
+        while start != -1:
+            try:
+                obj, _ = decoder.raw_decode(json_text[start:])
+            except json.JSONDecodeError:
+                start = json_text.find("{", start + 1)
+                continue
+
+            if isinstance(obj, dict):
+                norm_obj = {re.sub(r"\s+", "", str(k)): v for k, v in obj.items()}
+            else:
+                start = json_text.find("{", start + 1)
+                continue
+
+            if norm_obj.get("_") == "message":
+                msg_id = int(norm_obj.get("id"))
+                peer = norm_obj.get("peer_id") or {}
+                peer_norm = {re.sub(r"\s+", "", str(k)): v for k, v in peer.items()} if isinstance(peer, dict) else {}
+                peer_type = str(peer_norm.get("_", "")).lower()
+                if peer_type == "peerchannel":
+                    chat_id = int(f"-100{int(peer_norm.get('channel_id'))}")
+                elif peer_type == "peerchat":
+                    chat_id = -int(peer_norm.get("chat_id"))
+                elif peer_type == "peeruser":
+                    chat_id = int(peer_norm.get("user_id"))
+                else:
+                    raise ValueError("JSON 缺少可识别的 peer_id")
+                return chat_id, msg_id, 1
+            # 可能先命中到内层对象（例如 sizes/item），继续向后寻找 message 根对象
+            start = json_text.find("{", start + 1)
+            continue
+    except Exception:
+        # JSON 解析失败时继续走原有文本/链接解析
+        pass
 
     link_match = re.search(r"(?:https?://)?t\.me/(c/)?([^/\s]+)/(\d+)", text)
     if link_match:
         is_private = bool(link_match.group(1))
         chat_part = link_match.group(2)
         message_id = int(link_match.group(3))
+        comment_match = re.search(r"[?&]comment=(\d+)", text)
+        comment_id = int(comment_match.group(1)) if comment_match else None
 
         trailing = text[link_match.end():].strip()
         limit = 1
@@ -749,6 +822,26 @@ async def _parse_download_source(client, text):
         else:
             chat = await client.user_client.get_chat(chat_part)
             chat_id = chat.id
+
+        # 支持评论区链接：.../500?single&comment=665
+        # comment 参数存在时，切换到讨论组并从评论消息 ID 开始下载
+        if comment_id and not is_private:
+            try:
+                from pyrogram import raw
+
+                peer = await client.user_client.resolve_peer(chat_part)
+                discussion = await client.user_client.invoke(
+                    raw.functions.messages.GetDiscussionMessage(
+                        peer=peer,
+                        msg_id=message_id,
+                    )
+                )
+                if discussion and discussion.chats:
+                    discussion_chat_id = int(f"-100{discussion.chats[0].id}")
+                    return discussion_chat_id, comment_id, limit
+            except Exception:
+                # 兜底：如果讨论组解析失败，则继续按主贴消息处理
+                pass
 
         return chat_id, message_id, limit
 
@@ -881,7 +974,7 @@ async def do_batch_download(client, message, chat_id, limit, dest="collection", 
         dest_name = _download_dest_name(dest)
         send_client = client
     
-    mode_text = f"从消息 `{start_message_id}` 精准读取 {limit} 条" if start_message_id else f"扫描最后 {limit} 个媒体"
+    mode_text = f"从消息 `{start_message_id}` 往前精准读取 {limit} 条" if start_message_id else f"扫描最后 {limit} 个媒体"
     try:
         db.create_download_task(
             task_key=task_key,
@@ -917,7 +1010,7 @@ async def do_batch_download(client, message, chat_id, limit, dest="collection", 
         scan_count = 0
 
         if start_message_id:
-            # 精准模式：从指定消息 ID 往前取 N 条消息，适合已知视频消息 ID 的场景。
+            # 精准模式：从指定消息 ID 往前取 N 条消息。
             first_id = max(1, start_message_id - limit + 1)
             message_ids = list(range(start_message_id, first_id - 1, -1))
             try:
@@ -1144,16 +1237,44 @@ async def do_batch_download(client, message, chat_id, limit, dest="collection", 
                     )
                     continue
 
-                # 直接发给用户
+                # 直接发给用户（按媒体类型发送，尽量保持 Telegram 原生播放形态）
                 send_caption = _message_content_preview(target_msg) or ""
                 try:
-                    await client.send_document(
-                        message.chat.id,
-                        dl_path,
-                        caption=send_caption,
-                        force_document=False,
-                        file_name=file_name,
-                    )
+                    if target_msg.video:
+                        await client.send_video(
+                            message.chat.id,
+                            dl_path,
+                            caption=send_caption[:1024] if send_caption else None,
+                            supports_streaming=True,
+                            file_name=file_name,
+                        )
+                    elif target_msg.photo:
+                        await client.send_photo(
+                            message.chat.id,
+                            dl_path,
+                            caption=send_caption[:1024] if send_caption else None,
+                        )
+                    elif target_msg.audio:
+                        await client.send_audio(
+                            message.chat.id,
+                            dl_path,
+                            caption=send_caption[:1024] if send_caption else None,
+                            file_name=file_name,
+                        )
+                    elif target_msg.voice:
+                        await client.send_voice(
+                            message.chat.id,
+                            dl_path,
+                        )
+                    else:
+                        # 其他类型仍按文件发送
+                        await client.send_document(
+                            message.chat.id,
+                            dl_path,
+                            caption=send_caption[:1024] if send_caption else None,
+                            force_document=True,
+                            file_name=file_name,
+                        )
                     send_ok = True
                 except Exception as send_err:
                     fail_count += 1
@@ -2668,7 +2789,7 @@ async def sub_start_download_handler(client, message):
     if not await require_admin(client, message):
         return
     from pyrogram.types import ForceReply
-    user_interaction_state[message.from_user.id] = "waiting_dl_id_limit"
+    user_interaction_state[message.from_user.id] = "waiting_dl_chat_id"
     is_adm = message.from_user.id == client.admin_id
     await message.reply_text(
         "📥 **批量下载**\n\n"
@@ -2676,11 +2797,16 @@ async def sub_start_download_handler(client, message):
         "消息 ID 就是链接最后一段数字。\n\n"
         "消息链接：`https://t.me/c/1234567890/4567`\n"
         "其中频道 ID 为 `-1001234567890`，消息 ID 为 `4567`\n\n"
-        "默认使用 ⚡ 快速合集：不下载、不解密，速度快。\n"
-        "如果源消息禁止复制，任务会标记失败，可再改用加密合集尝试。\n\n"
+        "也可使用两步模式（推荐）：\n"
+        "① 先发频道ID（如 `-1001234567890`）\n"
+        "② 再发消息ID（如 `4567`），默认递减下载10条\n"
+        "   或发 `消息ID 数量`（如 `4567 20`）\n\n"
+        "默认使用 ⚡ 快速合集：优先直接复制，速度更快。\n"
+        "如果源消息禁止复制，会自动改为下载后直发给你。\n\n"
         "精准下载：`频道ID 消息ID 数量`\n"
         "例如：`-1001234567890 4567 1`（下载消息4567起共1条）\n"
         "例如：`-1001234567890 4567 5`（下载消息4567起共5条）\n\n"
+        "也支持直接粘贴 message JSON（含 `id` 与 `peer_id` 字段）自动识别。\n\n"
         "发 `取消` 或点 **❌ 取消操作** 可退出。",
         reply_markup=get_cancel_keyboard(is_adm)
     )
@@ -2818,36 +2944,96 @@ async def download_state_handler(client, message):
     uid = message.from_user.id
     state = user_interaction_state.get(uid)
 
-    # Handle original format: channel_id limit
-    if state == "waiting_dl_id_limit":
+    # Step 1: two-step mode - wait for channel id (or direct link/full args)
+    if state == "waiting_dl_chat_id":
         if not await require_admin(client, message):
             await clear_user_state(uid)
             message.stop_propagation()
             return
         try:
-            chat_id, start_message_id, limit = await _parse_download_source(client, message.text)
+            raw_text = message.text.strip()
+
+            # 兼容：直接发链接 / 完整格式，直接进入确认
+            if "t.me/" in raw_text or len(raw_text.split()) >= 2:
+                chat_id, start_message_id, limit = await _parse_download_source(client, raw_text)
+                user_interaction_state.pop(uid, None)
+                user_download_chat.pop(uid, None)
+                dest = user_download_dest.get(uid, "fast_collection")
+                await request_download_confirmation(client, message, chat_id, limit, dest, start_message_id=start_message_id)
+                message.stop_propagation()
+                return
+
+            chat_id = int(raw_text)
+            user_download_chat[uid] = chat_id
+            user_interaction_state[uid] = "waiting_dl_msg_id"
+            is_adm = message.from_user.id == client.admin_id
+            await message.reply_text(
+                f"✅ 已选择频道: `{chat_id}`\n\n"
+                "请发送消息ID（默认递减下载10条）：\n"
+                "• `4567`（默认10条）\n"
+                "• `4567 20`（递减20条）\n"
+                "• 也可直接发完整链接",
+                reply_markup=get_cancel_keyboard(is_adm)
+            )
+            message.stop_propagation()
+            return
         except Exception:
-            from handlers.setup import get_main_menu_keyboard
             is_adm = message.from_user.id == client.admin_id
             await message.reply_text(
                 "❌ 格式错误！\n\n"
-                "最简单：复制目标视频消息链接直接发给我。\n"
-                "消息 ID 是链接最后一段数字。\n\n"
-                "例：`https://t.me/c/1234567890/4567`\n"
-                "也可以输入：`频道ID 数量` 或 `频道ID 消息ID 数量`\n\n"
+                "第一步请先输入频道ID，例如：`-1001234567890`\n"
+                "或直接发消息链接：`https://t.me/c/1234567890/4567`\n\n"
+                "也可以输入完整格式：`频道ID 消息ID 数量`\n"
+                "或直接粘贴 message JSON（含 `id` 与 `peer_id`）。\n\n"
                 "点 **❌ 取消操作** 可退出当前输入。",
                 reply_markup=get_cancel_keyboard(is_adm)
             )
             return
-        
-        # Success! Consume state now
-        del user_interaction_state[uid]
-        
-        # Use default destination (fast collection)
-        dest = user_download_dest.get(uid, "fast_collection")
-        await request_download_confirmation(client, message, chat_id, limit, dest, start_message_id=start_message_id)
-        message.stop_propagation()
-        return
+
+    # Step 2: wait for msg id (or msg_id count)
+    if state == "waiting_dl_msg_id":
+        if not await require_admin(client, message):
+            await clear_user_state(uid)
+            message.stop_propagation()
+            return
+        try:
+            text = message.text.strip()
+            chat_id = user_download_chat.get(uid)
+            if not chat_id:
+                raise ValueError("missing chat")
+
+            # 允许在第二步仍然直接贴链接
+            if "t.me/" in text:
+                parsed_chat_id, start_message_id, limit = await _parse_download_source(client, text)
+                chat_id = parsed_chat_id
+            else:
+                parts = text.split()
+                if len(parts) == 1:
+                    start_message_id = int(parts[0])
+                    limit = 10
+                elif len(parts) >= 2:
+                    start_message_id = int(parts[0])
+                    limit = int(parts[1])
+                else:
+                    raise ValueError("invalid")
+
+            user_interaction_state.pop(uid, None)
+            user_download_chat.pop(uid, None)
+            dest = user_download_dest.get(uid, "fast_collection")
+            await request_download_confirmation(client, message, chat_id, limit, dest, start_message_id=start_message_id)
+            message.stop_propagation()
+            return
+        except Exception:
+            is_adm = message.from_user.id == client.admin_id
+            await message.reply_text(
+                "❌ 消息ID格式错误。\n\n"
+                "请发送：\n"
+                "• `4567`（默认递减10条）\n"
+                "• `4567 20`（递减20条）\n"
+                "• 或直接发消息链接",
+                reply_markup=get_cancel_keyboard(is_adm)
+            )
+            return
     
     message.continue_propagation()
 
