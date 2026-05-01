@@ -8,6 +8,7 @@ import os
 import time
 import math
 import asyncio
+import re
 from pyrogram import Client, filters
 from pyrogram.types import Message
 import config
@@ -27,6 +28,16 @@ def _get_semaphore() -> asyncio.Semaphore:
     if _download_semaphore is None:
         _download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
     return _download_semaphore
+
+async def _try_acquire_semaphore(sem: asyncio.Semaphore) -> bool:
+    """
+    尝试短超时获取信号量，避免直接读取私有属性 sem._value。
+    """
+    try:
+        await asyncio.wait_for(sem.acquire(), timeout=0.01)
+        return True
+    except asyncio.TimeoutError:
+        return False
 
 # 用户冷却时间（秒），防止刷屏
 USER_COOLDOWN = 10  # 10秒内只能发一个请求
@@ -103,6 +114,23 @@ def _parse_tg_link(url: str):
     raise ValueError("无法识别的链接格式")
 
 
+async def _resolve_comment_target(user_client, channel_ref, post_message_id: int, comment_message_id: int):
+    """将频道主贴 comment 链接转换为讨论组中的真实评论消息目标。"""
+    from pyrogram import raw
+
+    peer = await user_client.resolve_peer(channel_ref)
+    result = await user_client.invoke(
+        raw.functions.messages.GetDiscussionMessage(
+            peer=peer,
+            msg_id=post_message_id
+        )
+    )
+    if not result or not result.chats:
+        raise ValueError("无法定位讨论组")
+    discussion_chat_id = int("-100" + str(result.chats[0].id))
+    return discussion_chat_id, comment_message_id
+
+
 # ========== 主处理器 ==========
 @Client.on_message(
     # 兼容带参数的链接，如 ?single&comment=664
@@ -140,19 +168,32 @@ async def public_transfer_handler(client: Client, message: Message):
         await message.reply_text("❌ 无法解析链接格式，请发送正确的 Telegram 消息链接。")
         return
 
+    # 支持评论区链接: .../500?single&comment=665
+    comment_match = re.search(r"[?&]comment=(\d+)", url)
+    if comment_match and isinstance(chat_id, str):
+        try:
+            comment_id = int(comment_match.group(1))
+            chat_id, message_id = await _resolve_comment_target(client.user_client, chat_id, message_id, comment_id)
+        except Exception:
+            # 解析失败时按主贴继续，避免中断用户流程
+            pass
+
     status_msg = await message.reply_text("🔎 正在解析消息，请稍候...")
 
     # ---- 并发限制（使用懒初始化的 Semaphore）----
     sem = _get_semaphore()
-    if sem._value == 0:
+    acquired = await _try_acquire_semaphore(sem)
+    if not acquired:
         await status_msg.edit_text(
             "⚠️ 当前下载队列已满，请稍后再试。\n"
             f"（最多同时处理 {MAX_CONCURRENT_DOWNLOADS} 个任务）"
         )
         return
 
-    async with sem:
+    try:
         await _do_download_and_send(client, message, status_msg, chat_id, message_id)
+    finally:
+        sem.release()
 
 
 async def _do_download_and_send(client: Client, message: Message, status_msg, chat_id, message_id: int):
