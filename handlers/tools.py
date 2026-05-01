@@ -1311,51 +1311,9 @@ async def do_batch_download(client, message, chat_id, limit, dest="collection", 
                 copy_hint = ""
                 send_caption = _message_content_preview(target_msg) or ""
 
-                if target_msg.video or target_msg.photo:
-                    try:
-                        if target_msg.video:
-                            pending_fast_album.append({
-                                "kind": "video",
-                                "payload": target_msg.video.file_id,
-                                "media": InputMediaVideo(
-                                    target_msg.video.file_id,
-                                    caption=send_caption[:1024] if send_caption else None,
-                                ),
-                                "caption": send_caption[:1024],
-                                "file_name": file_name,
-                                "message_id": getattr(target_msg, "id", None),
-                                "chat_id": chat_id,
-                                "file_id": getattr(target_msg.video, "file_id", None),
-                                "file_unique_id": getattr(target_msg.video, "file_unique_id", None),
-                                "file_size": file_size,
-                                "mime_type": mime_type,
-                            })
-                        else:
-                            pending_fast_album.append({
-                                "kind": "photo",
-                                "payload": target_msg.photo.file_id,
-                                "media": InputMediaPhoto(
-                                    target_msg.photo.file_id,
-                                    caption=send_caption[:1024] if send_caption else None,
-                                ),
-                                "caption": send_caption[:1024],
-                                "file_name": file_name,
-                                "message_id": getattr(target_msg, "id", None),
-                                "chat_id": chat_id,
-                                "file_id": getattr(target_msg.photo, "file_id", None),
-                                "file_unique_id": getattr(target_msg.photo, "file_unique_id", None),
-                                "file_size": file_size,
-                                "mime_type": mime_type,
-                            })
-                        if len(pending_fast_album) >= 10:
-                            await flush_fast_album()
-                        continue
-                    except Exception as copy_err:
-                        copy_hint = _download_error_hint(copy_err)
-
                 await flush_fast_album()
 
-                # copy 失败（禁止转发）→ 下载后直接发给用户
+                # 为了兼容受保护内容，视频/图片统一先下载再按组发送。
                 try:
                     await dashboard_msg.edit_text(
                         f"🚀 **批量下载任务**\n"
