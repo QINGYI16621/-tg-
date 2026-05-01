@@ -1648,7 +1648,10 @@ async def do_batch_download(client, message, chat_id, limit, dest="collection", 
         first_name, first_key = success_keys[0]
         collection_tip = f"\n🔑 首个文件提取码: `{first_key}`"
 
-    await message.reply_text(f"🎉 **批量任务结束！**\n共处理: {total_count}\n成功: {success_count}\n目的地: {dest_name}{collection_tip}")
+    if not (dest == "fast_collection" and success_count > 0):
+        await message.reply_text(
+            f"🎉 **批量任务结束！**\n共处理: {total_count}\n成功: {success_count}\n目的地: {dest_name}{collection_tip}"
+        )
     if dest == "fast_collection" and default_collection and success_count > 0:
         try:
             collection = db.get_collection_by_key(default_collection["access_key"])
